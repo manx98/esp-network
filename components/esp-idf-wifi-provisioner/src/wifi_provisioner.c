@@ -44,8 +44,9 @@ static void on_credentials_set(void *arg, esp_event_base_t base,
     /* Switch from APSTA to STA-only (drops the AP, keeps STA connected) */
     esp_wifi_set_mode(WIFI_MODE_STA);
 
-    /* Get a reference to the STA netif (created by wifi_ap_start in APSTA mode) */
-    s_sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    /* Take ownership of the STA netif from the AP module so wifi_ap_stop()
+       won't destroy it while we're still using it for the active connection. */
+    s_sta_netif = wifi_ap_take_sta_netif();
 
     s_connected = true;
     xEventGroupSetBits(s_connected_event, CONNECTED_BIT);

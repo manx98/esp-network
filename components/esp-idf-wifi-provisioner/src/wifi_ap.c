@@ -10,12 +10,13 @@
 
 static const char *TAG = "wifi_prov_ap";
 
-static esp_netif_t *s_ap_netif = NULL;
+static esp_netif_t *s_ap_netif  = NULL;
+static esp_netif_t *s_sta_netif = NULL;
 
 esp_err_t wifi_ap_start(const wifi_prov_config_t *config)
 {
-    s_ap_netif = esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta(); /* needed for scan in APSTA mode */
+    s_ap_netif  = esp_netif_create_default_wifi_ap();
+    s_sta_netif = esp_netif_create_default_wifi_sta(); /* needed for scan in APSTA mode */
 
     wifi_config_t wifi_config = {
         .ap = {
@@ -44,6 +45,13 @@ esp_err_t wifi_ap_start(const wifi_prov_config_t *config)
     return ESP_OK;
 }
 
+esp_netif_t *wifi_ap_take_sta_netif(void)
+{
+    esp_netif_t *netif = s_sta_netif;
+    s_sta_netif = NULL;
+    return netif;
+}
+
 esp_err_t wifi_ap_stop(void)
 {
     esp_err_t err = esp_wifi_stop();
@@ -51,6 +59,11 @@ esp_err_t wifi_ap_stop(void)
     if (s_ap_netif) {
         esp_netif_destroy_default_wifi(s_ap_netif);
         s_ap_netif = NULL;
+    }
+
+    if (s_sta_netif) {
+        esp_netif_destroy_default_wifi(s_sta_netif);
+        s_sta_netif = NULL;
     }
 
     ESP_LOGI(TAG, "AP stopped");

@@ -33,6 +33,7 @@ esp_err_t wifi_sta_try_connect(const char *ssid, const char *password);
 
 esp_err_t wifi_ap_start(const wifi_prov_config_t *config);
 esp_err_t wifi_ap_stop(void);
+esp_netif_t *wifi_ap_take_sta_netif(void); /* transfer STA netif ownership away from AP module */
 
 /* ── DNS server ─────────────────────────────────────────────────────── */
 
