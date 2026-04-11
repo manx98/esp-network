@@ -39,6 +39,10 @@ typedef enum {
 
 static volatile app_state_t s_state = APP_STATE_IDLE;
 
+/* Tick count when entering CONNECTING; used for connection timeout. */
+static TickType_t s_connect_start_tick = 0;
+#define CONNECT_TIMEOUT_MS  30000
+
 /* IP cached at connect-time; refreshed by periodic RSSI updates */
 static char s_connected_ip[20] = {0};
 
@@ -170,6 +174,13 @@ static void on_portal_start(void)
     /* Display already set before wifi_prov_start() is called from main task. */
 }
 
+static void on_credentials(const char *ssid, const char *password)
+{
+    ESP_LOGI(TAG, "Portal credentials received – connecting to \"%s\"", ssid);
+    display_show("Connecting...", ssid, NULL, "[Click] Stop");
+    wifi_prov_connect_with_creds(ssid, password);
+}
+
 /* ── Button callbacks (timer task — only post commands) ──────────────── */
 
 static void button_single_click_cb(void *arg, void *usr_data)
@@ -227,6 +238,7 @@ void app_main(void)
     wf_config.on_connected      = on_connected;
     wf_config.on_connect_failed = on_connect_failed;
     wf_config.on_portal_start   = on_portal_start;
+    wf_config.on_credentials    = on_credentials;
 
     /* Button */
     const button_config_t btn_cfg = {
@@ -259,6 +271,15 @@ void app_main(void)
                     display_show_connected(ap_info.rssi);
                 }
             }
+            /* Connection timeout — if stuck in CONNECTING too long, fall back
+               to portal so the user isn't stranded on a "Connecting…" screen. */
+            if (s_state == APP_STATE_CONNECTING &&
+                (xTaskGetTickCount() - s_connect_start_tick) >=
+                    pdMS_TO_TICKS(CONNECT_TIMEOUT_MS)) {
+                ESP_LOGW(TAG, "Connection timeout – starting portal");
+                wifi_prov_stop();
+                do_start_portal();
+            }
             continue;
         }
 
@@ -266,10 +287,16 @@ void app_main(void)
 
         case CMD_START:
             s_state = APP_STATE_CONNECTING;
+            s_connect_start_tick = xTaskGetTickCount();
             display_show("Connecting...", "Using saved creds", NULL, "[Click] Stop");
-            if (wifi_prov_connect() == ESP_ERR_NOT_FOUND) {
-                /* No stored credentials — start portal immediately */
-                do_start_portal();
+            {
+                esp_err_t err = wifi_prov_connect(&wf_config);
+                if (err != ESP_OK) {
+                    /* ESP_ERR_NOT_FOUND = no stored creds;
+                       other errors     = connect attempt failed immediately.
+                       In both cases, start the portal. */
+                    do_start_portal();
+                }
             }
             /* ESP_OK → async connect; on_connected / on_connect_failed will fire */
             break;

@@ -30,6 +30,16 @@ typedef void (*wifi_prov_on_connect_failed_cb_t)(void);
 typedef void (*wifi_prov_on_portal_start_cb_t)(void);
 
 /**
+ * Callback fired when the user submits WiFi credentials via the captive portal.
+ * The application should call wifi_prov_connect_with_creds() inside this
+ * callback to initiate the connection attempt.
+ *
+ * @param ssid     NUL-terminated SSID submitted by the user.
+ * @param password NUL-terminated password submitted by the user.
+ */
+typedef void (*wifi_prov_on_credentials_cb_t)(const char *ssid, const char *password);
+
+/**
  * Provisioner configuration.
  * Use WIFI_PROV_DEFAULT_CONFIG() to initialise with Kconfig defaults.
  */
@@ -50,6 +60,7 @@ typedef struct {
     wifi_prov_on_connected_cb_t      on_connected;
     wifi_prov_on_connect_failed_cb_t on_connect_failed;
     wifi_prov_on_portal_start_cb_t   on_portal_start;
+    wifi_prov_on_credentials_cb_t    on_credentials;
 } wifi_prov_config_t;
 
 #define WIFI_PROV_DEFAULT_CONFIG() {                                        \
@@ -69,6 +80,7 @@ typedef struct {
     .on_connected      = NULL,                                              \
     .on_connect_failed = NULL,                                              \
     .on_portal_start   = NULL,                                              \
+    .on_credentials    = NULL,                                              \
 }
 
 /**
@@ -90,14 +102,26 @@ esp_err_t wifi_prov_start(const wifi_prov_config_t *config);
 /**
  * Attempt an async WiFi connection using stored NVS credentials.
  *
- * Must be called after wifi_prov_start().  Returns immediately without
- * blocking.  On success the portal is torn down automatically and the
- * on_connected callback is fired.  On failure the portal remains active.
+ * Returns immediately without blocking.  On success the on_connected
+ * callback is fired.  On failure on_connect_failed is fired.
  *
- * @return ESP_OK          – connection attempt started.
+ * @param config  Provisioner configuration (callbacks, max_retries, …).
+ *                Must remain valid until the result callback fires.
+ * @return ESP_OK            – connection attempt started.
  * @return ESP_ERR_NOT_FOUND – no stored credentials found.
  */
-esp_err_t wifi_prov_connect(void);
+esp_err_t wifi_prov_connect(const wifi_prov_config_t *config);
+
+/**
+ * Initiate an async WiFi connection with the supplied credentials.
+ *
+ * Intended to be called from within the on_credentials callback.
+ * On success the credentials are saved to NVS and the portal is torn down.
+ * On failure the portal remains active so the user can retry.
+ *
+ * @return ESP_OK on success, or an esp_err_t on failure.
+ */
+esp_err_t wifi_prov_connect_with_creds(const char *ssid, const char *password);
 
 /**
  * Stop the WiFi provisioner and release all resources.

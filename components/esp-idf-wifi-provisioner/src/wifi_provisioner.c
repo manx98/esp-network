@@ -103,13 +103,17 @@ static void on_credentials_set(void *arg, esp_event_base_t base,
     wifi_prov_creds_t *creds = (wifi_prov_creds_t *)data;
     ESP_LOGI(TAG, "Credentials received via portal – SSID: \"%s\"", creds->ssid);
 
-    /* Stash for NVS save when connection succeeds. */
-    strncpy(s_pending_ssid, creds->ssid, sizeof(s_pending_ssid) - 1);
-    strncpy(s_pending_pass, creds->password, sizeof(s_pending_pass) - 1);
-    s_has_pending_creds = true;
-
-    /* Single attempt (0 retries) — the user can resubmit if it fails. */
-    wifi_sta_connect_async(creds->ssid, creds->password, 0, on_sta_result);
+    if (s_config.on_credentials) {
+        /* Delegate to application callback — it must call
+           wifi_prov_connect_with_creds() to initiate the connection. */
+        s_config.on_credentials(creds->ssid, creds->password);
+    } else {
+        /* Default: connect immediately with a single attempt. */
+        strncpy(s_pending_ssid, creds->ssid, sizeof(s_pending_ssid) - 1);
+        strncpy(s_pending_pass, creds->password, sizeof(s_pending_pass) - 1);
+        s_has_pending_creds = true;
+        wifi_sta_connect_async(creds->ssid, creds->password, 0, on_sta_result);
+    }
 }
 
 /* ── Public API ─────────────────────────────────────────────────────── */
@@ -176,9 +180,12 @@ esp_err_t wifi_prov_start(const wifi_prov_config_t *config)
     return ESP_OK;
 }
 
-esp_err_t wifi_prov_connect(void)
+esp_err_t wifi_prov_connect(const wifi_prov_config_t *config)
 {
     ESP_ERROR_CHECK(wifi_prov_init());
+
+    /* Store config so on_sta_result can fire the correct callbacks. */
+    s_config = *config;
 
     char ssid[33]     = {0};
     char password[65] = {0};
@@ -207,6 +214,24 @@ esp_err_t wifi_prov_connect(void)
 
     ESP_LOGI(TAG, "Stored credentials found – connecting to \"%s\" …", ssid);
     return wifi_sta_connect_async(ssid, password, s_config.max_retries, on_sta_result);
+}
+
+esp_err_t wifi_prov_connect_with_creds(const char *ssid, const char *password)
+{
+    if (!ssid || ssid[0] == '\0') {
+        ESP_LOGE(TAG, "wifi_prov_connect_with_creds: empty SSID");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Stash for NVS save when the connection succeeds. */
+    strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
+    s_pending_ssid[sizeof(s_pending_ssid) - 1] = '\0';
+    strncpy(s_pending_pass, password ? password : "", sizeof(s_pending_pass) - 1);
+    s_pending_pass[sizeof(s_pending_pass) - 1] = '\0';
+    s_has_pending_creds = true;
+
+    /* Single attempt (0 retries) — the user can resubmit via the portal if it fails. */
+    return wifi_sta_connect_async(s_pending_ssid, s_pending_pass, 0, on_sta_result);
 }
 
 esp_err_t wifi_prov_stop(void)
