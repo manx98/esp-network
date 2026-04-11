@@ -111,7 +111,7 @@ void app_main(void)
     wf_config.ap_ssid        = "MyDevice-Setup";
     wf_config.on_connected   = on_connected;
     wf_config.on_portal_start = on_portal_start;
-
+    ESP_ERROR_CHECK(wifi_prov_init());
     // 主循环保持运行
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

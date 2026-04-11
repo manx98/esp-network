@@ -8,7 +8,6 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "esp_netif_types.h"
-#include "freertos/FreeRTOS.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,26 +71,30 @@ typedef struct {
 esp_err_t wifi_prov_init(void);
 
 /**
- * Start the WiFi provisioner.
+ * Start the captive-portal AP.
  *
  * Calls wifi_prov_init() automatically if not already done.
- * Reads stored credentials from NVS and attempts to connect.
- * Falls back to AP + captive portal on failure.
+ * If WiFi is already active (connecting or connected) it is stopped first.
+ * Does NOT attempt a WiFi connection — call wifi_prov_connect() for that.
  */
 esp_err_t wifi_prov_start(const wifi_prov_config_t *config);
+
+/**
+ * Attempt an async WiFi connection using stored NVS credentials.
+ *
+ * Must be called after wifi_prov_start().  Returns immediately without
+ * blocking.  On success the portal is torn down automatically and the
+ * on_connected callback is fired.  On failure the portal remains active.
+ *
+ * @return ESP_OK          – connection attempt started.
+ * @return ESP_ERR_NOT_FOUND – no stored credentials found.
+ */
+esp_err_t wifi_prov_connect(void);
 
 /**
  * Stop the WiFi provisioner and release all resources.
  */
 esp_err_t wifi_prov_stop(void);
-
-/**
- * Block until a station connection is established.
- *
- * @param timeout_ticks  FreeRTOS ticks to wait (portMAX_DELAY for forever).
- * @return ESP_OK on connection, ESP_ERR_TIMEOUT on timeout.
- */
-esp_err_t wifi_prov_wait_for_connection(TickType_t timeout_ticks);
 
 /**
  * Erase stored WiFi credentials from NVS.

@@ -54,8 +54,8 @@ esp_netif_t *wifi_ap_take_sta_netif(void)
 
 esp_err_t wifi_ap_stop(void)
 {
-    esp_err_t err = esp_wifi_stop();
-
+    /* Caller is responsible for esp_wifi_stop() / esp_wifi_deinit().
+       This function only releases the netif objects created by wifi_ap_start(). */
     if (s_ap_netif) {
         esp_netif_destroy_default_wifi(s_ap_netif);
         s_ap_netif = NULL;
@@ -66,6 +66,6 @@ esp_err_t wifi_ap_stop(void)
         s_sta_netif = NULL;
     }
 
-    ESP_LOGI(TAG, "AP stopped");
-    return err;
+    ESP_LOGI(TAG, "AP netifs released");
+    return ESP_OK;
 }

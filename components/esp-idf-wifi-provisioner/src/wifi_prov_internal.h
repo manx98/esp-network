@@ -25,9 +25,27 @@ esp_err_t nvs_store_erase(void);
 
 /* ── WiFi STA ───────────────────────────────────────────────────────── */
 
-esp_err_t wifi_sta_connect(const char *ssid, const char *password,
-                           uint8_t max_retries);
-esp_err_t wifi_sta_try_connect(const char *ssid, const char *password);
+/**
+ * Callback invoked from the event-loop task when the async connection
+ * attempt finishes.  connected=true on success, false on failure.
+ */
+typedef void (*wifi_sta_result_cb_t)(bool connected);
+
+/**
+ * Begin an async STA connection in the current WiFi mode.
+ * Registers event handlers and calls esp_wifi_connect(); returns
+ * immediately without blocking.  result_cb is called once on outcome.
+ * max_retries=0 means a single attempt (no retries).
+ */
+esp_err_t wifi_sta_connect_async(const char *ssid, const char *password,
+                                  uint8_t max_retries,
+                                  wifi_sta_result_cb_t result_cb);
+
+/**
+ * Cancel any pending async connection attempt.
+ * Unregisters event handlers; result_cb will NOT be called.
+ */
+void wifi_sta_cancel(void);
 
 /* ── WiFi AP ────────────────────────────────────────────────────────── */
 

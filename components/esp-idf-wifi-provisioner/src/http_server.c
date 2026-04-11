@@ -211,22 +211,14 @@ static esp_err_t save_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Received credentials – SSID: \"%s\"", creds.ssid);
 
-    /* Try connecting while keeping the AP alive */
-    esp_err_t err = wifi_sta_try_connect(creds.ssid, creds.password);
+    /* Hand credentials to the provisioner for an async connection attempt.
+       NVS save happens there on success; do not save here to avoid storing
+       credentials that turn out to be wrong. */
+    esp_event_post(WIFI_PROV_EVENT, WIFI_PROV_EVENT_CREDENTIALS_SET,
+                   &creds, sizeof(creds), pdMS_TO_TICKS(100));
 
     httpd_resp_set_type(req, "application/json");
-
-    if (err == ESP_OK) {
-        nvs_store_save(creds.ssid, creds.password);
-        httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
-
-        /* Post event so the orchestrator can switch to STA-only mode */
-        esp_event_post(WIFI_PROV_EVENT, WIFI_PROV_EVENT_CREDENTIALS_SET,
-                       &creds, sizeof(creds), pdMS_TO_TICKS(100));
-    } else {
-        httpd_resp_send(req, "{\"success\":false}", HTTPD_RESP_USE_STRLEN);
-    }
-
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
