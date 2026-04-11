@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <u8g2_esp32_hal.h>
 #include <soc/gpio_num.h>
 #include <iot_button.h>
@@ -7,113 +8,296 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
 
-// 按键配置
-#define BUTTON_GPIO_NUM     GPIO_NUM_21      // 根据你的开发板修改（ESP32-S2-Saola-1 的 BOOT 键是 GPIO0）
-#define BUTTON_ACTIVE_LEVEL 1      // 0=按下低电平，1=按下高电平
+/* ── Hardware ────────────────────────────────────────────────────────── */
 
-static u8g2_t u8g2;
-static wifi_prov_config_t wf_config = WIFI_PROV_DEFAULT_CONFIG();
+#define BUTTON_GPIO_NUM     GPIO_NUM_21
+#define BUTTON_ACTIVE_LEVEL 1
 
-static const char *TAG = "BUTTON";
+/* ── Globals ─────────────────────────────────────────────────────────── */
 
-// 回调函数
-static void button_single_click_cb(void *arg, void *usr_data)
+static const char *TAG = "main";
+
+static u8g2_t              u8g2;
+static wifi_prov_config_t  wf_config = WIFI_PROV_DEFAULT_CONFIG();
+static SemaphoreHandle_t   s_disp_mutex;
+static QueueHandle_t       s_cmd_queue;
+
+/* ── App state ───────────────────────────────────────────────────────── */
+
+typedef enum {
+    APP_STATE_IDLE,
+    APP_STATE_CONNECTING,   /* wifi_prov_connect() in progress */
+    APP_STATE_CONNECTED,
+    APP_STATE_PORTAL,       /* captive portal AP running */
+} app_state_t;
+
+static volatile app_state_t s_state = APP_STATE_IDLE;
+
+/* IP cached at connect-time; refreshed by periodic RSSI updates */
+static char s_connected_ip[20] = {0};
+
+/* ── Command queue (all WiFi control runs from the main task) ─────────── */
+
+typedef enum {
+    CMD_START,          /* button: try stored creds, fall back to portal */
+    CMD_STOP,           /* button: stop everything */
+    CMD_RESET,          /* button: erase creds + start portal */
+    CMD_START_PORTAL,   /* callback: stored creds failed, start portal */
+    CMD_AUTH_FAILED,    /* callback: portal submission failed, stay on portal */
+} app_cmd_t;
+
+/* ── Display ─────────────────────────────────────────────────────────── */
+
+/*
+ * General layout (5×7 font, 128×64 display):
+ *   y=10  line1  – title / status
+ *   y=22  line2  – detail (IP, SSID, …)
+ *   y=34  line3  – optional extra info
+ *   ────  y=48   – separator line
+ *   y=62  hint   – button guide
+ *
+ * Connected layout adds signal bars at top-right (x=111..126, y=2..12):
+ *   4 bars, bottom-aligned, filled = strong / outline = weak
+ */
+
+/* Called with s_disp_mutex already held. */
+static void draw_signal_bars(int rssi)
 {
-    static int started = 0;
-    esp_err_t err;
-    if (!started)
-    {
-        ESP_LOGI(TAG, "Starting button");
-        err = wifi_prov_start(&wf_config);
-    } else
-    {
-        ESP_LOGI(TAG, "Stop button");
-        err = wifi_prov_stop();
-    }
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "%s failed, err = %d", started ? "wifi_prov_stop": "wifi_prov_start" , err);
-    } else
-    {
-        started = !started;
+    /* How many bars to fill: ≥-55 → 4, ≥-65 → 3, ≥-75 → 2, ≥-85 → 1, else 0 */
+    int filled;
+    if      (rssi >= -55) filled = 4;
+    else if (rssi >= -65) filled = 3;
+    else if (rssi >= -75) filled = 2;
+    else if (rssi >= -85) filled = 1;
+    else                  filled = 0;
+
+    /* 4 bars × 3 px wide, 1 px gap; bottom edge at y=12, heights 4/6/8/10 */
+    static const struct { uint8_t x; uint8_t y; uint8_t h; } bars[4] = {
+        {111,  8, 4},
+        {115,  6, 6},
+        {119,  4, 8},
+        {123,  2, 10},
+    };
+    for (int i = 0; i < 4; i++) {
+        if (i < filled) {
+            u8g2_DrawBox(&u8g2, bars[i].x, bars[i].y, 3, bars[i].h);
+        } else {
+            u8g2_DrawFrame(&u8g2, bars[i].x, bars[i].y, 3, bars[i].h);
+        }
     }
 }
 
-static void button_double_click_cb(void *arg, void *usr_data)
+static void display_show(const char *line1, const char *line2,
+                          const char *line3, const char *hint)
 {
-    ESP_LOGI(TAG, "双击事件！");
+    if (xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     u8g2_ClearBuffer(&u8g2);
-    u8g2_DrawStr(&u8g2, 0, 20, "Dual click");
+    if (line1) u8g2_DrawStr(&u8g2, 0, 10, line1);
+    if (line2) u8g2_DrawStr(&u8g2, 0, 22, line2);
+    if (line3) u8g2_DrawStr(&u8g2, 0, 34, line3);
+    if (hint) {
+        u8g2_DrawHLine(&u8g2, 0, 48, 128);
+        u8g2_DrawStr(&u8g2, 0, 62, hint);
+    }
     u8g2_SendBuffer(&u8g2);
+    xSemaphoreGive(s_disp_mutex);
+}
+
+/* Connected-specific display: signal bars + IP + RSSI value */
+static void display_show_connected(int rssi)
+{
+    char rssi_str[14];
+    snprintf(rssi_str, sizeof(rssi_str), "RSSI: %d dBm", rssi);
+
+    if (xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    u8g2_ClearBuffer(&u8g2);
+    u8g2_DrawStr(&u8g2,  0, 10, "Connected!");
+    draw_signal_bars(rssi);                      /* top-right corner */
+    u8g2_DrawStr(&u8g2,  0, 22, s_connected_ip);
+    u8g2_DrawStr(&u8g2,  0, 34, rssi_str);
+    u8g2_DrawHLine(&u8g2, 0, 48, 128);
+    u8g2_DrawStr(&u8g2,  0, 62, "[Hold 3s] Reset");
+    u8g2_SendBuffer(&u8g2);
+    xSemaphoreGive(s_disp_mutex);
+}
+
+/* ── WiFi callbacks (event-loop task — only update display / post cmds) ── */
+
+static void on_connected(void)
+{
+    esp_netif_ip_info_t ip = {};
+    strncpy(s_connected_ip, "No IP", sizeof(s_connected_ip));
+    if (wifi_prov_get_ip_info(&ip) == ESP_OK) {
+        snprintf(s_connected_ip, sizeof(s_connected_ip), IPSTR, IP2STR(&ip.ip));
+    }
+
+    wifi_ap_record_t ap_info = {};
+    int rssi = -100;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = ap_info.rssi;
+    }
+
+    ESP_LOGI(TAG, "WiFi connected – IP: %s  RSSI: %d dBm", s_connected_ip, rssi);
+    s_state = APP_STATE_CONNECTED;
+    display_show_connected(rssi);
+}
+
+static void on_connect_failed(void)
+{
+    app_cmd_t cmd;
+    if (s_state == APP_STATE_CONNECTING) {
+        /* Stored credentials failed — ask main task to start portal */
+        ESP_LOGW(TAG, "Stored credentials failed, requesting portal");
+        display_show("Creds Failed", "Starting portal...", NULL, "");
+        cmd = CMD_START_PORTAL;
+    } else {
+        /* Portal submission failed — stay on portal, notify user */
+        ESP_LOGW(TAG, "Portal auth failed");
+        display_show("Auth Failed", "Wrong password?", "Try again", "[Click] Stop");
+        cmd = CMD_AUTH_FAILED;
+    }
+    xQueueSend(s_cmd_queue, &cmd, 0);
+}
+
+static void on_portal_start(void)
+{
+    /* Display already set before wifi_prov_start() is called from main task. */
+}
+
+/* ── Button callbacks (timer task — only post commands) ──────────────── */
+
+static void button_single_click_cb(void *arg, void *usr_data)
+{
+    app_cmd_t cmd = (s_state == APP_STATE_IDLE) ? CMD_START : CMD_STOP;
+    ESP_LOGI(TAG, "Single click → %s", cmd == CMD_START ? "START" : "STOP");
+    xQueueSend(s_cmd_queue, &cmd, 0);
 }
 
 static void button_long_press_cb(void *arg, void *usr_data)
 {
-    ESP_LOGI(TAG, "长按事件！");
-    u8g2_ClearBuffer(&u8g2);
-    u8g2_DrawStr(&u8g2, 0, 20, "Long press");
-    u8g2_SendBuffer(&u8g2);
+    ESP_LOGI(TAG, "Long press → RESET");
+    app_cmd_t cmd = CMD_RESET;
+    xQueueSend(s_cmd_queue, &cmd, 0);
 }
 
+/* ── Helpers called from main task only ──────────────────────────────── */
 
-static void init_u8g2()
+static void do_start_portal(void)
 {
-    u8g2_esp32_hal_t u8g2_esp32_hal = U8G2_ESP32_HAL_DEFAULT;
-    u8g2_esp32_hal.bus.i2c.sda = GPIO_NUM_8;
-    u8g2_esp32_hal.bus.i2c.scl = GPIO_NUM_9;
-    u8g2_esp32_hal_init(u8g2_esp32_hal);
+    s_state = APP_STATE_PORTAL;
+    display_show("Portal Active", wf_config.ap_ssid,
+                 "Connect & open", "[Click] Stop");
+    wifi_prov_start(&wf_config);
+}
+
+/* ── Init ────────────────────────────────────────────────────────────── */
+
+static void init_u8g2(void)
+{
+    u8g2_esp32_hal_t hal = U8G2_ESP32_HAL_DEFAULT;
+    hal.bus.i2c.sda = GPIO_NUM_8;
+    hal.bus.i2c.scl = GPIO_NUM_9;
+    u8g2_esp32_hal_init(hal);
     u8x8_SetI2CAddress(&u8g2.u8x8, 0x78);
-    u8g2_Setup_sh1106_i2c_128x64_noname_f(&u8g2, U8G2_R0, u8g2_esp32_i2c_byte_cb, u8g2_esp32_gpio_and_delay_cb);
-    u8g2_SetFont(&u8g2, u8g2_font_5x7_t_cyrillic );
+    u8g2_Setup_sh1106_i2c_128x64_noname_f(&u8g2, U8G2_R0,
+        u8g2_esp32_i2c_byte_cb, u8g2_esp32_gpio_and_delay_cb);
+    u8g2_SetFont(&u8g2, u8g2_font_5x7_t_cyrillic);
     u8g2_InitDisplay(&u8g2);
     u8g2_SetPowerSave(&u8g2, 0);
     u8g2_ClearDisplay(&u8g2);
 }
 
-static void on_connected(void)
-{
-    ESP_LOGI(TAG, "WiFi connected!");
-}
-
-static void on_portal_start(void)
-{
-    ESP_LOGI(TAG, "Captive portal started — connect to the AP to configure WiFi.");
-}
+/* ── Main ────────────────────────────────────────────────────────────── */
 
 void app_main(void)
 {
+    s_disp_mutex = xSemaphoreCreateMutex();
+    s_cmd_queue  = xQueueCreate(8, sizeof(app_cmd_t));
+
     init_u8g2();
-    // 1. 配置按钮时间参数（可选）
+
+    /* Configure provisioner */
+    wf_config.ap_ssid           = "MyDevice-Setup";
+    wf_config.on_connected      = on_connected;
+    wf_config.on_connect_failed = on_connect_failed;
+    wf_config.on_portal_start   = on_portal_start;
+
+    /* Button */
     const button_config_t btn_cfg = {
-        .long_press_time = 3000,      // 长按触发时间：3秒
-        .short_press_time = 100,      // 短按消抖时间：200ms
+        .long_press_time  = 3000,
+        .short_press_time = 100,
     };
-
-    // 2. 配置 GPIO
     const button_gpio_config_t btn_gpio_cfg = {
-        .gpio_num = BUTTON_GPIO_NUM,
+        .gpio_num     = BUTTON_GPIO_NUM,
         .active_level = BUTTON_ACTIVE_LEVEL,
-        .disable_pull = false,        // 启用内部上拉/下拉
+        .disable_pull = false,
     };
-
-    // 3. 创建按键设备
     button_handle_t btn = NULL;
     ESP_ERROR_CHECK(iot_button_new_gpio_device(&btn_cfg, &btn_gpio_cfg, &btn));
+    iot_button_register_cb(btn, BUTTON_SINGLE_CLICK,   NULL, button_single_click_cb, NULL);
+    iot_button_register_cb(btn, BUTTON_LONG_PRESS_UP,  NULL, button_long_press_cb,   NULL);
 
-    // 4. 注册事件回调
-    iot_button_register_cb(btn, BUTTON_SINGLE_CLICK, NULL, button_single_click_cb, NULL);
-    iot_button_register_cb(btn, BUTTON_DOUBLE_CLICK, NULL, button_double_click_cb, NULL);
-    iot_button_register_cb(btn, BUTTON_LONG_PRESS_UP, NULL, button_long_press_cb, NULL);
-
-    ESP_LOGI(TAG, "按键示例已启动，按下 GPIO%d 试试", BUTTON_GPIO_NUM);
-    wf_config.ap_ssid        = "MyDevice-Setup";
-    wf_config.on_connected   = on_connected;
-    wf_config.on_portal_start = on_portal_start;
     ESP_ERROR_CHECK(wifi_prov_init());
-    // 主循环保持运行
+
+    display_show("WiFi Provisioner", "Ready", NULL, "[Click] Start");
+    ESP_LOGI(TAG, "Ready – press GPIO%d to start", BUTTON_GPIO_NUM);
+
+    /* ── Command loop ─────────────────────────────────────────────────── */
+    app_cmd_t cmd;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            /* Timeout — refresh signal strength if connected */
+            if (s_state == APP_STATE_CONNECTED) {
+                wifi_ap_record_t ap_info = {};
+                if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                    display_show_connected(ap_info.rssi);
+                }
+            }
+            continue;
+        }
+
+        switch (cmd) {
+
+        case CMD_START:
+            s_state = APP_STATE_CONNECTING;
+            display_show("Connecting...", "Using saved creds", NULL, "[Click] Stop");
+            if (wifi_prov_connect() == ESP_ERR_NOT_FOUND) {
+                /* No stored credentials — start portal immediately */
+                do_start_portal();
+            }
+            /* ESP_OK → async connect; on_connected / on_connect_failed will fire */
+            break;
+
+        case CMD_STOP:
+            wifi_prov_stop();
+            s_state = APP_STATE_IDLE;
+            display_show("Idle", "", NULL, "[Click] Start");
+            break;
+
+        case CMD_RESET:
+            wifi_prov_stop();
+            wifi_prov_erase_credentials();
+            do_start_portal();
+            break;
+
+        case CMD_START_PORTAL:
+            /* Guard: only proceed if we were actually connecting.
+               Prevents a stale CMD_START_PORTAL from firing after CMD_STOP. */
+            if (s_state == APP_STATE_CONNECTING) {
+                do_start_portal();
+            }
+            break;
+
+        case CMD_AUTH_FAILED:
+            /* Portal stays active; display already updated in callback. */
+            s_state = APP_STATE_PORTAL;
+            break;
+        }
     }
 }
