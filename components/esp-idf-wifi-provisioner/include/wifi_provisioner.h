@@ -19,6 +19,12 @@ extern "C" {
 typedef void (*wifi_prov_on_connected_cb_t)(void);
 
 /**
+ * Callback fired when a WiFi connection attempt fails (all retries exhausted).
+ * The portal remains active so the user can try different credentials.
+ */
+typedef void (*wifi_prov_on_connect_failed_cb_t)(void);
+
+/**
  * Callback fired when the captive portal AP is started.
  */
 typedef void (*wifi_prov_on_portal_start_cb_t)(void);
@@ -41,8 +47,9 @@ typedef struct {
     const char *connected_header;
     const char *connected_subheader;
     const char *page_footer;
-    wifi_prov_on_connected_cb_t    on_connected;
-    wifi_prov_on_portal_start_cb_t on_portal_start;
+    wifi_prov_on_connected_cb_t      on_connected;
+    wifi_prov_on_connect_failed_cb_t on_connect_failed;
+    wifi_prov_on_portal_start_cb_t   on_portal_start;
 } wifi_prov_config_t;
 
 #define WIFI_PROV_DEFAULT_CONFIG() {                                        \
@@ -60,6 +67,7 @@ typedef struct {
     .connected_subheader = CONFIG_WIFI_PROV_CONNECTED_SUBHEADER,           \
     .page_footer       = CONFIG_WIFI_PROV_PAGE_FOOTER,                     \
     .on_connected      = NULL,                                              \
+    .on_connect_failed = NULL,                                              \
     .on_portal_start   = NULL,                                              \
 }
 
