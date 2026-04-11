@@ -35,13 +35,18 @@ typedef enum {
     APP_STATE_CONNECTING,   /* wifi_prov_connect() in progress */
     APP_STATE_CONNECTED,
     APP_STATE_PORTAL,       /* captive portal AP running */
+    APP_STATE_RETRY_WAIT,   /* connect failed, counting down before next retry */
 } app_state_t;
 
 static volatile app_state_t s_state = APP_STATE_IDLE;
 
-/* Tick count when entering CONNECTING; used for connection timeout. */
+/* Tick count when entering CONNECTING; safety-net timeout per attempt. */
 static TickType_t s_connect_start_tick = 0;
 #define CONNECT_TIMEOUT_MS  30000
+
+/* Tick count when entering RETRY_WAIT; controls next retry. */
+static TickType_t s_retry_start_tick = 0;
+#define RETRY_INTERVAL_MS   30000
 
 /* IP cached at connect-time; refreshed by periodic RSSI updates */
 static char s_connected_ip[20] = {0};
@@ -49,11 +54,11 @@ static char s_connected_ip[20] = {0};
 /* ── Command queue (all WiFi control runs from the main task) ─────────── */
 
 typedef enum {
-    CMD_START,          /* button: try stored creds, fall back to portal */
-    CMD_STOP,           /* button: stop everything */
-    CMD_RESET,          /* button: erase creds + start portal */
-    CMD_START_PORTAL,   /* callback: stored creds failed, start portal */
-    CMD_AUTH_FAILED,    /* callback: portal submission failed, stay on portal */
+    CMD_START,           /* button: try stored creds */
+    CMD_STOP,            /* button: stop everything  */
+    CMD_RESET,           /* button: erase creds + open portal */
+    CMD_CONNECT_FAILED,  /* callback: connection attempt failed */
+    CMD_AUTH_FAILED,     /* callback: portal submission failed, stay on portal */
 } app_cmd_t;
 
 /* ── Display ─────────────────────────────────────────────────────────── */
@@ -131,6 +136,14 @@ static void display_show_connected(int rssi)
     xSemaphoreGive(s_disp_mutex);
 }
 
+/* Retry-wait display: show remaining seconds until next attempt. */
+static void display_show_retry(uint32_t remaining_s)
+{
+    char countdown[20];
+    snprintf(countdown, sizeof(countdown), "Retry in %lus...", (unsigned long)remaining_s);
+    display_show("Connect Failed", countdown, NULL, "[Hold 3s] Reset WiFi");
+}
+
 /* ── WiFi callbacks (event-loop task — only update display / post cmds) ── */
 
 static void on_connected(void)
@@ -156,12 +169,12 @@ static void on_connect_failed(void)
 {
     app_cmd_t cmd;
     if (s_state == APP_STATE_CONNECTING) {
-        /* Stored credentials failed — ask main task to start portal */
-        ESP_LOGW(TAG, "Stored credentials failed, requesting portal");
-        display_show("Creds Failed", "Starting portal...", NULL, "");
-        cmd = CMD_START_PORTAL;
+        /* Stored-creds connect failed — schedule a background retry. */
+        ESP_LOGW(TAG, "Connection failed – will retry in %d s",
+                 RETRY_INTERVAL_MS / 1000);
+        cmd = CMD_CONNECT_FAILED;
     } else {
-        /* Portal submission failed — stay on portal, notify user */
+        /* Portal submission failed — stay on portal, notify user. */
         ESP_LOGW(TAG, "Portal auth failed");
         display_show("Auth Failed", "Wrong password?", "Try again", "[Click] Stop");
         cmd = CMD_AUTH_FAILED;
@@ -205,6 +218,26 @@ static void do_start_portal(void)
     display_show("Portal Active", wf_config.ap_ssid,
                  "Connect & open", "[Click] Stop");
     wifi_prov_start(&wf_config);
+}
+
+static void do_connect(void)
+{
+    s_state = APP_STATE_CONNECTING;
+    s_connect_start_tick = xTaskGetTickCount();
+    display_show("Connecting...", "Using saved creds", NULL, "[Click] Stop");
+
+    esp_err_t err = wifi_prov_connect(&wf_config);
+    if (err == ESP_ERR_NOT_FOUND) {
+        /* No stored credentials — tell user to long-press for setup. */
+        ESP_LOGI(TAG, "No stored credentials");
+        s_state = APP_STATE_IDLE;
+        display_show("No Credentials", "Hold to setup WiFi", NULL, "[Hold 3s] Setup");
+    } else if (err != ESP_OK) {
+        /* Immediate failure — fall into the retry path. */
+        app_cmd_t fc = CMD_CONNECT_FAILED;
+        xQueueSend(s_cmd_queue, &fc, 0);
+    }
+    /* ESP_OK → async; on_connected / on_connect_failed will fire. */
 }
 
 /* ── Init ────────────────────────────────────────────────────────────── */
@@ -264,41 +297,47 @@ void app_main(void)
     app_cmd_t cmd;
     while (1) {
         if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            /* Timeout — refresh signal strength if connected */
+            /* Timeout tick ─────────────────────────────────────────────── */
+
+            /* Refresh signal strength when connected. */
             if (s_state == APP_STATE_CONNECTED) {
                 wifi_ap_record_t ap_info = {};
                 if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
                     display_show_connected(ap_info.rssi);
                 }
             }
-            /* Connection timeout — if stuck in CONNECTING too long, fall back
-               to portal so the user isn't stranded on a "Connecting…" screen. */
+
+            /* Safety-net: if stuck in CONNECTING too long, treat as failure. */
             if (s_state == APP_STATE_CONNECTING &&
                 (xTaskGetTickCount() - s_connect_start_tick) >=
                     pdMS_TO_TICKS(CONNECT_TIMEOUT_MS)) {
-                ESP_LOGW(TAG, "Connection timeout – starting portal");
+                ESP_LOGW(TAG, "Connection timeout – scheduling retry");
                 wifi_prov_stop();
-                do_start_portal();
+                cmd = CMD_CONNECT_FAILED;
+                goto handle_cmd;
             }
+
+            /* Retry countdown: fire connect when interval elapses. */
+            if (s_state == APP_STATE_RETRY_WAIT) {
+                TickType_t elapsed = xTaskGetTickCount() - s_retry_start_tick;
+                if (elapsed >= pdMS_TO_TICKS(RETRY_INTERVAL_MS)) {
+                    ESP_LOGI(TAG, "Retrying WiFi connection…");
+                    do_connect();
+                } else {
+                    uint32_t remaining_ms = RETRY_INTERVAL_MS
+                                           - (uint32_t)pdTICKS_TO_MS(elapsed);
+                    display_show_retry((remaining_ms + 999) / 1000);
+                }
+            }
+
             continue;
         }
 
+handle_cmd:
         switch (cmd) {
 
         case CMD_START:
-            s_state = APP_STATE_CONNECTING;
-            s_connect_start_tick = xTaskGetTickCount();
-            display_show("Connecting...", "Using saved creds", NULL, "[Click] Stop");
-            {
-                esp_err_t err = wifi_prov_connect(&wf_config);
-                if (err != ESP_OK) {
-                    /* ESP_ERR_NOT_FOUND = no stored creds;
-                       other errors     = connect attempt failed immediately.
-                       In both cases, start the portal. */
-                    do_start_portal();
-                }
-            }
-            /* ESP_OK → async connect; on_connected / on_connect_failed will fire */
+            do_connect();
             break;
 
         case CMD_STOP:
@@ -313,11 +352,13 @@ void app_main(void)
             do_start_portal();
             break;
 
-        case CMD_START_PORTAL:
-            /* Guard: only proceed if we were actually connecting.
-               Prevents a stale CMD_START_PORTAL from firing after CMD_STOP. */
+        case CMD_CONNECT_FAILED:
+            /* Guard: only enter retry-wait if we were actually connecting.
+               Prevents a stale event from firing after CMD_STOP. */
             if (s_state == APP_STATE_CONNECTING) {
-                do_start_portal();
+                s_state = APP_STATE_RETRY_WAIT;
+                s_retry_start_tick = xTaskGetTickCount();
+                display_show_retry(RETRY_INTERVAL_MS / 1000);
             }
             break;
 
