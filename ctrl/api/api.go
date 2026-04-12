@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/manx98/esp32-ctrl/device"
@@ -17,6 +18,12 @@ import (
 // API wires the HTTP mux to the device.
 type API struct {
 	dev *device.Device
+
+	// manuallyDisconnected is set when the user explicitly calls disconnect,
+	// and cleared when they call connect. It persists across page reloads so
+	// the UI can distinguish "user disconnected" from "never connected".
+	mu                   sync.Mutex
+	manuallyDisconnected bool
 }
 
 // New creates an API backed by dev.
@@ -201,6 +208,9 @@ func (a *API) handleWifiConnect(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	a.mu.Lock()
+	a.manuallyDisconnected = false
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -214,6 +224,9 @@ func (a *API) handleWifiDisconnect(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	a.mu.Lock()
+	a.manuallyDisconnected = true
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -247,11 +260,16 @@ func (a *API) handleWifiGetStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		stateName = "unknown"
 	}
+	a.mu.Lock()
+	manuallyDisconnected := a.manuallyDisconnected
+	a.mu.Unlock()
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"state":      state,
-		"state_name": stateName,
-		"ip":         ip,
-		"rssi":       rssi,
+		"state":                state,
+		"state_name":           stateName,
+		"ip":                   ip,
+		"rssi":                 rssi,
+		"manually_disconnected": manuallyDisconnected,
 	})
 }
 
