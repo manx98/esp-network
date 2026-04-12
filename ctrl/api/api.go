@@ -204,6 +204,10 @@ func (a *API) handleWifiSetConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// New config saved → treat as "disconnected" so the Connect button appears.
+	a.mu.Lock()
+	a.manuallyDisconnected = true
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

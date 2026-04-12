@@ -66,6 +66,17 @@
     <div id="sysInfo" class="info-grid"></div>
   </div>
 
+  <!-- WiFi Control -->
+  <div class="card">
+    <h2>WiFi 连接</h2>
+    <div class="row" style="margin-bottom:.75rem">
+      <button id="btnConnect"    class="btn-success" onclick="doConnect()"    style="display:none">连接</button>
+      <button id="btnDisconnect" class="btn-danger"  onclick="doDisconnect()" style="display:none">断开</button>
+      <button class="btn-gray"   onclick="doGetStatus()">刷新状态</button>
+    </div>
+    <div id="wifiStatus" class="info-grid"></div>
+  </div>
+
   <!-- WiFi Config -->
   <div class="card">
     <h2>WiFi 配置</h2>
@@ -78,20 +89,10 @@
         <label>密码</label>
         <input id="inPass" type="password" placeholder="密码" maxlength="64">
       </div>
-      <button class="btn-primary" onclick="doSetConfig()">保存</button>
+      <button class="btn-primary" onclick="doSetConfig(true)">保存并连接</button>
+      <button class="btn-gray"    onclick="doSetConfig(false)">仅保存</button>
       <button class="btn-gray"    onclick="doGetConfig()">读取</button>
     </div>
-  </div>
-
-  <!-- WiFi Control -->
-  <div class="card">
-    <h2>WiFi 连接</h2>
-    <div class="row" style="margin-bottom:.75rem">
-      <button id="btnConnect"    class="btn-success" onclick="doConnect()"    style="display:none">连接</button>
-      <button id="btnDisconnect" class="btn-danger"  onclick="doDisconnect()" style="display:none">断开</button>
-      <button class="btn-gray"   onclick="doGetStatus()">刷新状态</button>
-    </div>
-    <div id="wifiStatus" class="info-grid"></div>
   </div>
 
   <!-- Scan -->
@@ -232,13 +233,14 @@ async function doReset() {
 }
 
 // ── WiFi config ──────────────────────────────────────────────────────────────
-async function doSetConfig() {
+async function doSetConfig(andConnect) {
   const ssid = document.getElementById('inSSID').value.trim();
   const password = document.getElementById('inPass').value;
   if (!ssid) { toast('请输入 SSID', 'err'); return; }
   const r = await api('POST', '/api/wifi/config', { ssid, password });
   if (r.error) { toast(r.error, 'err'); return; }
-  toast('配置已保存');
+  toast(andConnect ? '配置已保存，正在连接…' : '配置已保存');
+  if (andConnect) await doConnect();
 }
 
 async function doGetConfig() {
