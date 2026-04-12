@@ -14,6 +14,7 @@
 #include "tinyusb_default_config.h"
 #include "proto.h"
 #include "wifi_mgr.h"
+#include "cpu_monitor.h"
 
 static const char *TAG = "main";
 
@@ -64,11 +65,45 @@ static void handle_ping(const proto_frame_t *f)
 
 static void handle_get_dev_info(const proto_frame_t *f)
 {
-    char info[64];
-    int len = snprintf(info, sizeof(info), "esp32-network v1.0 idf:%s",
-                       esp_get_idf_version());
-    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK,
-                      (uint8_t *)info, (size_t)len);
+    /*
+     * Payload format:
+     *   [fw_ver_len : 1]
+     *   [fw_ver     : N]   IDF version string (no null terminator)
+     *   [free_heap  : 4]   uint32 LE
+     *   [total_heap : 4]   uint32 LE
+     *   [min_heap   : 4]   uint32 LE  (minimum since boot)
+     *   [cpu_load   : 1]   uint8  0–100 %
+     *   [uptime_s   : 4]   uint32 LE  (seconds since boot)
+     *   [task_count : 2]   uint16 LE
+     */
+    const char *ver     = esp_get_idf_version();
+    uint8_t     ver_len = (uint8_t)strlen(ver);
+
+    uint32_t free_heap  = esp_get_free_heap_size();
+    uint32_t total_heap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    uint32_t min_heap   = esp_get_minimum_free_heap_size();
+    uint8_t  cpu_load   = cpu_monitor_get_load();
+    uint32_t uptime_s   = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    uint16_t task_count = (uint16_t)uxTaskGetNumberOfTasks();
+
+    uint8_t buf[1 + 64 + 4 + 4 + 4 + 1 + 4 + 2];
+    size_t n = 0;
+
+    buf[n++] = ver_len;
+    memcpy(&buf[n], ver, ver_len);  n += ver_len;
+
+#define PUT_U32(v) do { buf[n]=(v)&0xFF; buf[n+1]=((v)>>8)&0xFF; \
+                        buf[n+2]=((v)>>16)&0xFF; buf[n+3]=((v)>>24)&0xFF; n+=4; } while(0)
+    PUT_U32(free_heap);
+    PUT_U32(total_heap);
+    PUT_U32(min_heap);
+    buf[n++] = cpu_load;
+    PUT_U32(uptime_s);
+    buf[n++] = (uint8_t)(task_count & 0xFF);
+    buf[n++] = (uint8_t)(task_count >> 8);
+#undef PUT_U32
+
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, n);
 }
 
 static void handle_reset(const proto_frame_t *f)
@@ -285,6 +320,9 @@ void app_main(void)
     esp_timer_handle_t led_timer;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &led_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(led_timer, LED_TIMER_PERIOD_US));
+
+    /* CPU monitor */
+    cpu_monitor_init();
 
     /* WiFi */
     ESP_ERROR_CHECK(wifi_mgr_init());

@@ -109,7 +109,48 @@ func (a *API) handleGetDevInfo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"info": string(f.Payload)})
+
+	// Payload: [fw_ver_len:1][fw_ver:N][free_heap:4LE][total_heap:4LE]
+	//          [min_heap:4LE][cpu_load:1][uptime_s:4LE][task_count:2LE]
+	p := f.Payload
+	if len(p) < 1 {
+		writeErr(w, http.StatusBadGateway, "short payload")
+		return
+	}
+	verLen := int(p[0])
+	p = p[1:]
+	if len(p) < verLen+15 { // 3×4 + 1 + 4 + 2 = 15
+		writeErr(w, http.StatusBadGateway, "truncated payload")
+		return
+	}
+	fwVer := string(p[:verLen])
+	p = p[verLen:]
+
+	le32 := func(b []byte) uint32 {
+		return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+	}
+	freeHeap  := le32(p[0:4])
+	totalHeap := le32(p[4:8])
+	minHeap   := le32(p[8:12])
+	cpuLoad   := p[12]
+	uptimeS   := le32(p[13:17])
+	taskCount := uint16(p[17]) | uint16(p[18])<<8
+
+	heapUsedPct := uint32(0)
+	if totalHeap > 0 {
+		heapUsedPct = (totalHeap - freeHeap) * 100 / totalHeap
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"fw_version":    fwVer,
+		"free_heap":     freeHeap,
+		"total_heap":    totalHeap,
+		"min_free_heap": minHeap,
+		"heap_used_pct": heapUsedPct,
+		"cpu_load":      cpuLoad,
+		"uptime_s":      uptimeS,
+		"task_count":    taskCount,
+	})
 }
 
 func (a *API) handleReset(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ idf_component_register(
         "esp32-network.c"
         "proto.c"
         "wifi_mgr.c"
+        "cpu_monitor.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
@@ -10,5 +11,6 @@ idf_component_register(
         esp_event
         esp_netif
         esp_timer
+        esp_system
         driver
 )

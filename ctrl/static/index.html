@@ -59,12 +59,11 @@
   <!-- System -->
   <div class="card">
     <h2>系统</h2>
-    <div class="row">
+    <div class="row" style="margin-bottom:.75rem">
       <button class="btn-primary" onclick="doPing()">Ping</button>
-      <button class="btn-gray"    onclick="doInfo()">设备信息</button>
       <button class="btn-danger"  onclick="doReset()">重启设备</button>
     </div>
-    <div id="sysInfo" class="info-grid" style="margin-top:.75rem"></div>
+    <div id="sysInfo" class="info-grid"></div>
   </div>
 
   <!-- WiFi Config -->
@@ -138,9 +137,10 @@ function infoGrid(container, items) {
 // ── Poll device + WiFi status every 3 s ─────────────────────────────────────
 async function pollStatus() {
   try {
-    const [dev, wifi] = await Promise.all([
+    const [dev, wifi, info] = await Promise.all([
       api('GET', '/api/status'),
       api('GET', '/api/wifi/status').catch(() => null),
+      api('GET', '/api/info').catch(() => null),
     ]);
 
     const devBadge = document.getElementById('devBadge');
@@ -155,7 +155,33 @@ async function pollStatus() {
       renderWifiStatus(wifi);
       updateWifiButtons(wifi);
     }
+
+    if (info && !info.error) renderDevInfo(info);
   } catch {}
+}
+
+function fmtBytes(b) {
+  if (b >= 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + ' MB';
+  if (b >= 1024)         return (b / 1024).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
+function fmtUptime(s) {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return `${h}h ${m}m ${sec}s`;
+}
+
+function renderDevInfo(d) {
+  infoGrid(document.getElementById('sysInfo'), [
+    ['固件版本', 'IDF ' + d.fw_version],
+    ['CPU 占用', d.cpu_load + ' %'],
+    ['内存占用', d.heap_used_pct + ' %'],
+    ['空闲内存', fmtBytes(d.free_heap)],
+    ['最低空闲', fmtBytes(d.min_free_heap)],
+    ['总内存',   fmtBytes(d.total_heap)],
+    ['运行时间', fmtUptime(d.uptime_s)],
+    ['任务数量', d.task_count],
+  ]);
 }
 
 function rssiLabel(rssi) {
@@ -198,12 +224,6 @@ async function doPing() {
   toast('Pong: ' + r.pong);
 }
 
-async function doInfo() {
-  const r = await api('GET', '/api/info');
-  if (r.error) { toast(r.error, 'err'); return; }
-  infoGrid(document.getElementById('sysInfo'), [['固件信息', r.info]]);
-  toast('已获取设备信息');
-}
 
 async function doReset() {
   if (!confirm('确认重启设备？')) return;
