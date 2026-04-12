@@ -158,7 +158,9 @@ async function pollStatus() {
     }
 
     if (info && !info.error) renderDevInfo(info);
-  } catch {}
+  } catch (e){
+    console.error(e)
+  }
 }
 
 function fmtBytes(b) {
@@ -182,6 +184,8 @@ function renderDevInfo(d) {
     ['总内存',   fmtBytes(d.total_heap)],
     ['运行时间', fmtUptime(d.uptime_s)],
     ['任务数量', d.task_count],
+    ['接收', fmtBytes(d.rx_bytes)],
+    ['发送', fmtBytes(d.tx_bytes)],
   ]);
 }
 

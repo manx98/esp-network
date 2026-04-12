@@ -4,6 +4,7 @@ idf_component_register(
         "proto.c"
         "wifi_mgr.c"
         "cpu_monitor.c"
+        "tcp_mgr.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
@@ -13,4 +14,5 @@ idf_component_register(
         esp_timer
         esp_system
         driver
+        lwip
 )

@@ -17,7 +17,7 @@ const (
 	RespFlag byte = 0x80
 )
 
-const MaxPayload = 256
+const MaxPayload = 1024
 
 // Cmd is a protocol command byte.
 type Cmd byte
@@ -39,6 +39,16 @@ const (
 	CmdWifiDisconnect Cmd = 0x13
 	CmdWifiGetStatus  Cmd = 0x14
 	CmdWifiScan       Cmd = 0x15
+
+	// TCP tunnelling (0x20–0x22)
+	CmdTCPConnect    Cmd = 0x20 // [host_len:1][host:N][port_hi:1][port_lo:1] → [conn_id:1]
+	CmdTCPSend       Cmd = 0x21 // [conn_id:1][data...] (fire-and-forget, no response)
+	CmdTCPClose      Cmd = 0x22 // [conn_id:1] → OK
+	CmdTcpConnectAck Cmd = 0x23
+
+	// Push frames from ESP32 (IsResp=false, unsolicited)
+	CmdTCPDataPush   Cmd = 0x40 // [conn_id:1][data...]
+	CmdTCPClosedPush Cmd = 0x41 // [conn_id:1]
 )
 
 // Status is the first byte of every response payload.
@@ -169,7 +179,7 @@ func NewParser(onFrame func(Frame)) *Parser {
 }
 
 func (p *Parser) reset() {
-	p.state   = stMagic0
+	p.state = stMagic0
 	p.crcCalc = 0xFFFF
 }
 
@@ -249,7 +259,7 @@ func (p *Parser) Feed(data []byte) {
 					IsResp: isResp,
 				}
 				if isResp && len(p.body) > 2 {
-					f.Status  = Status(p.body[2])
+					f.Status = Status(p.body[2])
 					f.Payload = append([]byte(nil), p.body[3:]...)
 				} else {
 					f.Payload = append([]byte(nil), p.body[2:]...)

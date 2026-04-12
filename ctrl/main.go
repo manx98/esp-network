@@ -10,16 +10,18 @@ import (
 
 	"github.com/manx98/esp32-ctrl/api"
 	"github.com/manx98/esp32-ctrl/device"
+	"github.com/manx98/esp32-ctrl/socks5"
 )
 
 //go:embed static
 var staticFiles embed.FS
 
 func main() {
-	port  := flag.String("port",   "/dev/ttyACM0", "Serial port (e.g. /dev/ttyACM0 or COM3)")
-	baud  := flag.Int("baud",    115200,          "Baud rate")
-	addr  := flag.String("addr",  ":8080",         "HTTP listen address")
-	debug := flag.Bool("debug",  false,            "Enable debug logging")
+	port      := flag.String("port",   "/dev/ttyACM0", "Serial port (e.g. /dev/ttyACM0 or COM3)")
+	baud      := flag.Int("baud",    115200,          "Baud rate")
+	addr      := flag.String("addr",  ":8080",         "HTTP listen address")
+	socks5Addr := flag.String("socks5", ":1080",       "SOCKS5 proxy listen address (empty to disable)")
+	debug     := flag.Bool("debug",  false,            "Enable debug logging")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -35,6 +37,16 @@ func main() {
 			"port", *port, "err", err)
 	}
 	defer dev.Close()
+
+	// SOCKS5 proxy
+	if *socks5Addr != "" {
+		proxy := socks5.New(dev)
+		go func() {
+			if err := proxy.ListenAndServe(*socks5Addr); err != nil {
+				slog.Error("socks5 proxy error", "err", err)
+			}
+		}()
+	}
 
 	// HTTP mux
 	mux := http.NewServeMux()

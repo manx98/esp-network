@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "tinyusb.h"
 #include "tinyusb_cdc_acm.h"
@@ -15,6 +16,7 @@
 #include "proto.h"
 #include "wifi_mgr.h"
 #include "cpu_monitor.h"
+#include "tcp_mgr.h"
 
 static const char *TAG = "main";
 
@@ -35,10 +37,45 @@ static void led_timer_cb(void *arg)
 
 /* ── CDC ── */
 #define CDC_RX_BUF_SIZE    512
-#define CMD_STREAM_SIZE    1024   /* StreamBuffer for RX bytes → cmd task */
+#define CDC_TX_CHUNK       512   /* TinyUSB CDC TX ring-buffer size */
+#define CMD_STREAM_SIZE    4096   /* StreamBuffer for RX bytes → cmd task */
 #define RESP_BUF_SIZE      (PROTO_MAX_PAYLOAD + 32)
+#define PUSH_BUF_SIZE      (PROTO_MAX_PAYLOAD + 32)
 
-static StreamBufferHandle_t s_cmd_stream;
+static StreamBufferHandle_t  s_cmd_stream;
+static SemaphoreHandle_t     s_cdc_mu;   /* serialises all CDC writes */
+
+/* Write len bytes to CDC (caller must hold s_cdc_mu).
+ * Splits into CDC_TX_CHUNK-sized pieces and flushes each one so the
+ * TX ring-buffer never overflows, ensuring all bytes are delivered. */
+static void cdc_write_locked(const uint8_t *buf, size_t len)
+{
+    size_t sent = 0;
+    while (sent < len) {
+        size_t chunk = len - sent;
+        uint32_t available_size = tud_cdc_n_write_available(TINYUSB_CDC_ACM_0);
+        if (available_size == 0)
+        {
+            esp_err_t err = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(200));
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "tud_cdcacm_write_queue() failed: %s", esp_err_to_name(err));
+                break;
+            }
+        } else
+        {
+            if (chunk > available_size)
+            {
+                chunk = available_size;
+            }
+            tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0,
+                                                        (uint8_t *)(buf + sent),
+                                                        chunk);
+            sent += chunk;
+        }
+    }
+    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(200));
+    atomic_store(&s_data_active, 1);
+}
 
 /* Send a response frame on CDC port 0 */
 static void cdc_send_response(uint8_t seq, uint8_t cmd,
@@ -50,9 +87,27 @@ static void cdc_send_response(uint8_t seq, uint8_t cmd,
                                        buf, sizeof(buf));
     if (len == 0) return;
 
-    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, buf, len);
-    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(50));
-    atomic_store(&s_data_active, 1);
+    xSemaphoreTake(s_cdc_mu, portMAX_DELAY);
+    cdc_write_locked(buf, len);
+    xSemaphoreGive(s_cdc_mu);
+}
+
+/* Send an unsolicited push frame (called from tcp_rx_task).
+ * Uses heap allocation to avoid blowing the caller's stack. */
+static void cdc_send_push(uint8_t cmd, const uint8_t *data, size_t data_len)
+{
+    uint8_t *buf = malloc(PUSH_BUF_SIZE);
+    if (!buf) {
+        ESP_LOGE(TAG, "cdc_send_push: OOM");
+        return;
+    }
+    size_t len = proto_build_push(cmd, data, data_len, buf, PUSH_BUF_SIZE);
+    if (len > 0) {
+        xSemaphoreTake(s_cdc_mu, portMAX_DELAY);
+        cdc_write_locked(buf, len);
+        xSemaphoreGive(s_cdc_mu);
+    }
+    free(buf);
 }
 
 /* ── Command handlers ── */
@@ -85,8 +140,11 @@ static void handle_get_dev_info(const proto_frame_t *f)
     uint8_t  cpu_load   = cpu_monitor_get_load();
     uint32_t uptime_s   = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     uint16_t task_count = (uint16_t)uxTaskGetNumberOfTasks();
-
-    uint8_t buf[1 + 64 + 4 + 4 + 4 + 1 + 4 + 2];
+    uint64_t tx_bytes;
+    uint64_t rx_bytes;
+    tcp_mgr_get_bytes(&rx_bytes, &tx_bytes);
+    /* 1(ver_len) + 64(ver) + 4+4+4(heap) + 1(cpu) + 4(uptime) + 2(tasks) + 8+8(bytes) */
+    uint8_t buf[1 + 64 + 4 + 4 + 4 + 1 + 4 + 2 + 8 + 8];
     size_t n = 0;
 
     buf[n++] = ver_len;
@@ -94,6 +152,19 @@ static void handle_get_dev_info(const proto_frame_t *f)
 
 #define PUT_U32(v) do { buf[n]=(v)&0xFF; buf[n+1]=((v)>>8)&0xFF; \
                         buf[n+2]=((v)>>16)&0xFF; buf[n+3]=((v)>>24)&0xFF; n+=4; } while(0)
+
+#define PUT_U64(v) do { \
+buf[n] = (v) & 0xFF; \
+buf[n+1] = ((v) >> 8) & 0xFF; \
+buf[n+2] = ((v) >> 16) & 0xFF; \
+buf[n+3] = ((v) >> 24) & 0xFF; \
+buf[n+4] = ((v) >> 32) & 0xFF; \
+buf[n+5] = ((v) >> 40) & 0xFF; \
+buf[n+6] = ((v) >> 48) & 0xFF; \
+buf[n+7] = ((v) >> 56) & 0xFF; \
+n += 8; \
+} while(0)
+
     PUT_U32(free_heap);
     PUT_U32(total_heap);
     PUT_U32(min_heap);
@@ -101,7 +172,10 @@ static void handle_get_dev_info(const proto_frame_t *f)
     PUT_U32(uptime_s);
     buf[n++] = (uint8_t)(task_count & 0xFF);
     buf[n++] = (uint8_t)(task_count >> 8);
+    PUT_U64(rx_bytes);
+    PUT_U64(tx_bytes);
 #undef PUT_U32
+#undef PUT_U64
 
     cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, n);
 }
@@ -222,11 +296,76 @@ static void handle_wifi_scan(const proto_frame_t *f)
     cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, n);
 }
 
+/* ── TCP command handlers ─────────────────────────────────────────────────── */
+
+static void handle_tcp_connect(const proto_frame_t *f)
+{
+    /* payload: [host_len:1][host:N][port_hi:1][port_lo:1] */
+    const uint8_t *p   = f->payload;
+    size_t         rem = f->payload_len;
+
+    if (rem < 1) goto bad_arg;
+    uint8_t host_len = *p++;  rem--;
+    if (rem < (size_t)host_len + 2) goto bad_arg;
+
+    char host[256];
+    memcpy(host, p, host_len);
+    host[host_len] = '\0';
+    p   += host_len;
+    rem -= host_len;
+
+    uint16_t port = ((uint16_t)p[0] << 8) | p[1];
+
+    int conn_id = tcp_mgr_connect(host, port);
+    if (conn_id == -2) {
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_BUSY, NULL, 0);
+        return;
+    }
+    if (conn_id < 0) {
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_ERROR, NULL, 0);
+        return;
+    }
+    uint8_t resp[1] = {(uint8_t)conn_id};
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, resp, 1);
+    return;
+
+bad_arg:
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
+}
+
+static void handle_tcp_send(const proto_frame_t *f)
+{
+    /* payload: [conn_id:1][data...] — no response sent */
+    if (f->payload_len < 2) return;
+    uint8_t conn_id = f->payload[0];
+    if (tcp_mgr_send(conn_id, &f->payload[1], f->payload_len - 1) == -1)
+    {
+        tcp_mgr_close(conn_id);
+        cdc_send_push(CMD_TCP_CLOSED_PUSH, &conn_id, 1);
+    }
+}
+
+static void handle_tcp_connect_ack(const proto_frame_t *f)
+{
+    if (f->payload_len < 1) return;
+    tcp_mgr_ready(f->payload[0]);
+}
+
+static void handle_tcp_close(const proto_frame_t *f)
+{
+    if (f->payload_len < 1) {
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
+        return;
+    }
+    tcp_mgr_close(f->payload[0]);
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, NULL, 0);
+}
+
 /* ── Frame dispatcher (runs in cmd_task context) ── */
 
 static void on_frame(const proto_frame_t *f, void *ctx)
 {
-    ESP_LOGD(TAG, "CMD=0x%02X SEQ=%u payload_len=%u", f->cmd, f->seq, f->payload_len);
+    ESP_LOGI(TAG, "CMD=0x%02X SEQ=%u payload_len=%u", f->cmd, f->seq, f->payload_len);
 
     switch ((proto_cmd_t)f->cmd) {
     case CMD_PING:              handle_ping(f);              break;
@@ -238,6 +377,10 @@ static void on_frame(const proto_frame_t *f, void *ctx)
     case CMD_WIFI_DISCONNECT:   handle_wifi_disconnect(f);   break;
     case CMD_WIFI_GET_STATUS:   handle_wifi_get_status(f);   break;
     case CMD_WIFI_SCAN:         handle_wifi_scan(f);         break;
+    case CMD_TCP_CONNECT:       handle_tcp_connect(f);       break;
+    case CMD_TCP_SEND:          handle_tcp_send(f);          break;
+    case CMD_TCP_CONNECT_ACK:   handle_tcp_connect_ack(f);   break;
+    case CMD_TCP_CLOSE:         handle_tcp_close(f);         break;
     default:
         ESP_LOGW(TAG, "Unknown CMD=0x%02X", f->cmd);
         cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
@@ -256,6 +399,7 @@ static void cmd_task(void *arg)
         size_t n = xStreamBufferReceive(s_cmd_stream, buf, sizeof(buf),
                                         portMAX_DELAY);
         if (n > 0) {
+            ESP_LOGI(TAG, "Received %d bytes", n);
             proto_parser_feed(parser, buf, n);
         }
     }
@@ -272,7 +416,6 @@ static void usb_cdc_rx_callback(int itf, cdcacm_event_t *event)
     if (ret != ESP_OK || rx_size == 0) return;
 
     atomic_store(&s_data_active, 1);
-
     /* Forward to command task via StreamBuffer (non-blocking) */
     size_t sent = xStreamBufferSend(s_cmd_stream, tmp, rx_size, 0);
     if (sent < rx_size) {
@@ -293,6 +436,7 @@ static void usb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Starting...");
     /* NVS */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -327,10 +471,17 @@ void app_main(void)
     /* WiFi */
     ESP_ERROR_CHECK(wifi_mgr_init());
 
+    /* CDC write mutex */
+    s_cdc_mu = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_cdc_mu ? ESP_OK : ESP_ERR_NO_MEM);
+
     /* StreamBuffer for CDC → cmd_task */
     s_cmd_stream = xStreamBufferCreate(CMD_STREAM_SIZE, 1);
-    xTaskCreate(cmd_task, "cmd", 4096, NULL, 5, NULL);
+    xTaskCreate(cmd_task, "cmd", 8192, NULL, 5, NULL);
 
+    /* TCP manager (SOCKS5 tunnelling) */
+    tcp_mgr_init(cdc_send_push);
+    wifi_mgr_connect();
     /* TinyUSB */
     const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));

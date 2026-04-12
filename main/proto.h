@@ -20,7 +20,7 @@
 #define PROTO_MAGIC0        0xAAU
 #define PROTO_MAGIC1        0x55U
 #define PROTO_RESP_FLAG     0x80U
-#define PROTO_MAX_PAYLOAD   256U
+#define PROTO_MAX_PAYLOAD   1024U
 
 /* ── Command table ──────────────────────────────────────────────────────────
  * Range     Owner          Notes
@@ -45,7 +45,15 @@ typedef enum {
     CMD_WIFI_GET_STATUS = 0x14,  /* → [state:1][ip:4] */
     CMD_WIFI_SCAN       = 0x15,  /* → [count:1]([ssid_len:1][ssid][rssi:1][auth:1])* */
 
-    /* Reserved placeholders (0x20–0x7E) not listed here */
+    /* TCP tunneling (0x20–0x22) */
+    CMD_TCP_CONNECT     = 0x20,  /* [host_len:1][host:N][port_hi:1][port_lo:1] → [conn_id:1] */
+    CMD_TCP_SEND        = 0x21,  /* [conn_id:1][data...] (no response) */
+    CMD_TCP_CLOSE       = 0x22,  /* [conn_id:1] → OK */
+    CMD_TCP_CONNECT_ACK = 0x23,
+
+    /* Push frames (ESP32 → host, unsolicited, no RESP_FLAG) */
+    CMD_TCP_DATA_PUSH   = 0x40,  /* [conn_id:1][data...] */
+    CMD_TCP_CLOSED_PUSH = 0x41,  /* [conn_id:1] */
 } proto_cmd_t;
 
 /* ── Status codes (first byte of every response payload) ── */
@@ -93,3 +101,18 @@ size_t proto_build_response(uint8_t seq, uint8_t cmd,
                              proto_status_t status,
                              const uint8_t *data, size_t data_len,
                              uint8_t *buf, size_t buf_size);
+
+/**
+ * Build an unsolicited push frame (ESP32 → host) into buf.
+ * Uses SEQ=0, no RESP_FLAG.
+ *
+ * @param cmd       Push command (e.g. CMD_TCP_DATA_PUSH)
+ * @param data      Payload bytes (may be NULL)
+ * @param data_len  Length of data
+ * @param buf       Output buffer
+ * @param buf_size  Size of output buffer
+ * @return Total bytes written, or 0 on buffer overflow
+ */
+size_t proto_build_push(uint8_t cmd,
+                         const uint8_t *data, size_t data_len,
+                         uint8_t *buf, size_t buf_size);

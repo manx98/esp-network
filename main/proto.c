@@ -179,3 +179,41 @@ size_t proto_build_response(uint8_t seq, uint8_t cmd,
 
     return n;
 }
+
+size_t proto_build_push(uint8_t cmd,
+                         const uint8_t *data, size_t data_len,
+                         uint8_t *buf, size_t buf_size)
+{
+    /* body = [SEQ=0:1][CMD:1][DATA:N] (no RESP_FLAG, no status byte) */
+    uint16_t body_len  = (uint16_t)(2 + data_len);
+    size_t   frame_len = 2u + 2u + body_len + 2u;
+
+    if (buf_size < frame_len) {
+        ESP_LOGE(TAG, "Push buffer too small: need %u have %u",
+                 (unsigned)frame_len, (unsigned)buf_size);
+        return 0;
+    }
+
+
+    size_t n = 0;
+    buf[n++] = PROTO_MAGIC0;
+    buf[n++] = PROTO_MAGIC1;
+    buf[n++] = (uint8_t)(body_len >> 8);
+    buf[n++] = (uint8_t)(body_len & 0xFF);
+    buf[n++] = 0;    /* seq = 0 for unsolicited push */
+    buf[n++] = cmd;  /* no RESP_FLAG */
+
+    if (data && data_len > 0) {
+        memcpy(&buf[n], data, data_len);
+        n += data_len;
+    }
+
+    uint16_t crc = CRC_INIT;
+    for (size_t k = 0; k < n; k++) {
+        crc = crc16_update(crc, buf[k]);
+    }
+    buf[n++] = (uint8_t)(crc >> 8);
+    buf[n++] = (uint8_t)(crc & 0xFF);
+
+    return n;
+}

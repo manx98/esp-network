@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -34,18 +35,18 @@ func New(dev *device.Device) *API {
 // Register mounts all routes onto mux and serves the embedded static UI.
 func (a *API) Register(mux *http.ServeMux) {
 	// System
-	mux.HandleFunc("GET /api/ping",        a.handlePing)
-	mux.HandleFunc("GET /api/info",        a.handleGetDevInfo)
-	mux.HandleFunc("POST /api/reset",      a.handleReset)
-	mux.HandleFunc("GET /api/status",      a.handleDeviceStatus)
+	mux.HandleFunc("GET /api/ping", a.handlePing)
+	mux.HandleFunc("GET /api/info", a.handleGetDevInfo)
+	mux.HandleFunc("POST /api/reset", a.handleReset)
+	mux.HandleFunc("GET /api/status", a.handleDeviceStatus)
 
 	// WiFi
-	mux.HandleFunc("POST /api/wifi/config",      a.handleWifiSetConfig)
-	mux.HandleFunc("GET /api/wifi/config",       a.handleWifiGetConfig)
-	mux.HandleFunc("POST /api/wifi/connect",     a.handleWifiConnect)
-	mux.HandleFunc("POST /api/wifi/disconnect",  a.handleWifiDisconnect)
-	mux.HandleFunc("GET /api/wifi/status",       a.handleWifiGetStatus)
-	mux.HandleFunc("GET /api/wifi/scan",         a.handleWifiScan)
+	mux.HandleFunc("POST /api/wifi/config", a.handleWifiSetConfig)
+	mux.HandleFunc("GET /api/wifi/config", a.handleWifiGetConfig)
+	mux.HandleFunc("POST /api/wifi/connect", a.handleWifiConnect)
+	mux.HandleFunc("POST /api/wifi/disconnect", a.handleWifiDisconnect)
+	mux.HandleFunc("GET /api/wifi/status", a.handleWifiGetStatus)
+	mux.HandleFunc("GET /api/wifi/scan", a.handleWifiScan)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -129,11 +130,11 @@ func (a *API) handleGetDevInfo(w http.ResponseWriter, r *http.Request) {
 	le32 := func(b []byte) uint32 {
 		return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 	}
-	freeHeap  := le32(p[0:4])
+	freeHeap := le32(p[0:4])
 	totalHeap := le32(p[4:8])
-	minHeap   := le32(p[8:12])
-	cpuLoad   := p[12]
-	uptimeS   := le32(p[13:17])
+	minHeap := le32(p[8:12])
+	cpuLoad := p[12]
+	uptimeS := le32(p[13:17])
 	taskCount := uint16(p[17]) | uint16(p[18])<<8
 
 	heapUsedPct := uint32(0)
@@ -150,6 +151,8 @@ func (a *API) handleGetDevInfo(w http.ResponseWriter, r *http.Request) {
 		"cpu_load":      cpuLoad,
 		"uptime_s":      uptimeS,
 		"task_count":    taskCount,
+		"tx_bytes":      binary.LittleEndian.Uint64(p[19:27]),
+		"rx_bytes":      binary.LittleEndian.Uint64(p[27:35]),
 	})
 }
 
@@ -310,10 +313,10 @@ func (a *API) handleWifiGetStatus(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"state":                state,
-		"state_name":           stateName,
-		"ip":                   ip,
-		"rssi":                 rssi,
+		"state":                 state,
+		"state_name":            stateName,
+		"ip":                    ip,
+		"rssi":                  rssi,
 		"manually_disconnected": manuallyDisconnected,
 	})
 }
