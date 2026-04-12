@@ -1,544 +1,310 @@
 #include <stdio.h>
 #include <string.h>
-#include <u8g2_esp32_hal.h>
-#include <soc/gpio_num.h>
-#include <iot_button.h>
-#include <button_gpio.h>
-#include <wifi_provisioner.h>
-
+#include <stdatomic.h>
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
-#include "esp_timer.h"
-
-static void display_show(const char *line1, const char *line2,
-                          const char *line3, const char *hint);
-
-static void display_show_connected(int rssi);
-
-static void draw_signal_bars(int rssi);
-/* ── Hardware ────────────────────────────────────────────────────────── */
-
-#define BUTTON_GPIO_NUM     GPIO_NUM_21
-#define BUTTON_ACTIVE_LEVEL 1
-#define LONG_PRESS_TIME_MS  3000   /* must match button_config_t.long_press_time */
-
-/* ── Globals ─────────────────────────────────────────────────────────── */
+#include "freertos/stream_buffer.h"
+#include "driver/gpio.h"
+#include "tinyusb.h"
+#include "tinyusb_cdc_acm.h"
+#include "tinyusb_default_config.h"
+#include "proto.h"
+#include "wifi_mgr.h"
 
 static const char *TAG = "main";
 
-static u8g2_t              u8g2;
-static wifi_prov_config_t  wf_config = WIFI_PROV_DEFAULT_CONFIG();
-static SemaphoreHandle_t   s_disp_mutex;
-static QueueHandle_t       s_cmd_queue;
+/* ── LED ── */
+#define LED_GPIO            GPIO_NUM_15
+#define LED_TIMER_PERIOD_US (50 * 1000)   /* 50 ms */
 
-/* ── Long-press progress state ───────────────────────────────────────── */
+static atomic_int s_data_active = 0;
 
-static esp_timer_handle_t  s_progress_timer  = NULL;
-static TickType_t          s_press_down_tick  = 0;
-static volatile bool       s_in_long_press    = false; /* progress bar showing  */
-static volatile bool       s_long_press_done  = false; /* threshold was reached */
-static volatile bool       s_progress_shown   = false; /* bar was rendered ≥1 frame */
-
-/* ── App state ───────────────────────────────────────────────────────── */
-
-typedef enum {
-    APP_STATE_IDLE,
-    APP_STATE_CONNECTING,   /* wifi_prov_connect() in progress */
-    APP_STATE_CONNECTED,
-    APP_STATE_PORTAL,       /* captive portal AP running */
-    APP_STATE_RETRY_WAIT,   /* connect failed, counting down before next retry */
-} app_state_t;
-
-static volatile app_state_t s_state = APP_STATE_IDLE;
-
-/* Tick count when entering CONNECTING; safety-net timeout per attempt. */
-static TickType_t s_connect_start_tick = 0;
-#define CONNECT_TIMEOUT_MS  30000
-
-/* Tick count when entering RETRY_WAIT; controls next retry. */
-static TickType_t s_retry_start_tick = 0;
-#define RETRY_INTERVAL_MS   5000
-
-/* IP cached at connect-time; refreshed by periodic RSSI updates */
-static char s_connected_ip[20] = {0};
-
-/* ── Command queue (all WiFi control runs from the main task) ─────────── */
-
-typedef enum {
-    CMD_START,           /* button: try stored creds */
-    CMD_STOP,            /* button: stop everything  */
-    CMD_RESET,           /* button: erase creds + open portal */
-    CMD_CONNECT_FAILED,  /* callback: connection attempt failed */
-    CMD_AUTH_FAILED,     /* callback: portal submission failed, stay on portal */
-    CMD_DISCONNECTED,    /* callback: WiFi link lost while connected */
-} app_cmd_t;
-
-/* ── Display ─────────────────────────────────────────────────────────── */
-
-/*
- * General layout (5×7 font, 128×64 display):
- *   y=10  line1  – title / status
- *   y=22  line2  – detail (IP, SSID, …)
- *   y=34  line3  – optional extra info
- *   ────  y=48   – separator line
- *   y=62  hint   – button guide
- *
- * Connected layout adds signal bars at top-right (x=111..126, y=2..12):
- *   4 bars, bottom-aligned, filled = strong / outline = weak
- */
-
-/* Draw current-state content into the buffer (mutex must already be held). */
-static void draw_state_content(void)
+static void led_timer_cb(void *arg)
 {
-    switch (s_state) {
-    case APP_STATE_IDLE:
-        u8g2_DrawStr(&u8g2, 0, 10, "WiFi Provisioner");
-        u8g2_DrawStr(&u8g2, 0, 22, "Ready");
-        break;
-    case APP_STATE_CONNECTING:
-        u8g2_DrawStr(&u8g2, 0, 10, "Connecting...");
-        u8g2_DrawStr(&u8g2, 0, 22, "Using saved creds");
-        break;
-    case APP_STATE_CONNECTED: {
-        wifi_ap_record_t ap_info = {};
-        int rssi = -100;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) rssi = ap_info.rssi;
-        u8g2_DrawStr(&u8g2, 0, 10, "Connected!");
-        draw_signal_bars(rssi);
-        u8g2_DrawStr(&u8g2, 0, 22, s_connected_ip);
-        break;
+    if (atomic_exchange(&s_data_active, 0)) {
+        gpio_set_level(LED_GPIO, 1);
+    } else {
+        gpio_set_level(LED_GPIO, 0);
     }
-    case APP_STATE_PORTAL:
-        u8g2_DrawStr(&u8g2, 0, 10, "Portal Active");
-        u8g2_DrawStr(&u8g2, 0, 22, wf_config.ap_ssid);
-        break;
-    case APP_STATE_RETRY_WAIT:
-        u8g2_DrawStr(&u8g2, 0, 10, "Connect Failed");
-        u8g2_DrawStr(&u8g2, 0, 22, "Retrying...");
+}
+
+/* ── CDC ── */
+#define CDC_RX_BUF_SIZE    512
+#define CMD_STREAM_SIZE    1024   /* StreamBuffer for RX bytes → cmd task */
+#define RESP_BUF_SIZE      (PROTO_MAX_PAYLOAD + 32)
+
+static StreamBufferHandle_t s_cmd_stream;
+
+/* Send a response frame on CDC port 0 */
+static void cdc_send_response(uint8_t seq, uint8_t cmd,
+                              proto_status_t status,
+                              const uint8_t *data, size_t data_len)
+{
+    uint8_t buf[RESP_BUF_SIZE];
+    size_t  len = proto_build_response(seq, cmd, status, data, data_len,
+                                       buf, sizeof(buf));
+    if (len == 0) return;
+
+    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, buf, len);
+    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(50));
+    atomic_store(&s_data_active, 1);
+}
+
+/* ── Command handlers ── */
+
+static void handle_ping(const proto_frame_t *f)
+{
+    const uint8_t pong[] = "PONG";
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, pong, sizeof(pong) - 1);
+}
+
+static void handle_get_dev_info(const proto_frame_t *f)
+{
+    char info[64];
+    int len = snprintf(info, sizeof(info), "esp32-network v1.0 idf:%s",
+                       esp_get_idf_version());
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK,
+                      (uint8_t *)info, (size_t)len);
+}
+
+static void handle_reset(const proto_frame_t *f)
+{
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, NULL, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
+}
+
+static void handle_wifi_set_config(const proto_frame_t *f)
+{
+    /* Payload: [ssid_len:1][ssid:N][pass_len:1][pass:M] */
+    const uint8_t *p = f->payload;
+    size_t         remaining = f->payload_len;
+
+    if (remaining < 1) goto bad_arg;
+    uint8_t ssid_len = *p++;  remaining--;
+    if (remaining < ssid_len + 1) goto bad_arg;
+
+    char ssid[WIFI_MGR_SSID_MAX + 1] = {0};
+    memcpy(ssid, p, ssid_len);
+    p += ssid_len;  remaining -= ssid_len;
+
+    uint8_t pass_len = *p++;  remaining--;
+    if (remaining < pass_len) goto bad_arg;
+
+    char pass[WIFI_MGR_PASS_MAX + 1] = {0};
+    memcpy(pass, p, pass_len);
+
+    esp_err_t ret = wifi_mgr_set_config(ssid, pass);
+    cdc_send_response(f->seq, f->cmd,
+                      ret == ESP_OK ? PROTO_STATUS_OK : PROTO_STATUS_ERROR,
+                      NULL, 0);
+    return;
+
+bad_arg:
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
+}
+
+static void handle_wifi_get_config(const proto_frame_t *f)
+{
+    wifi_mgr_config_t cfg = {0};
+    esp_err_t ret = wifi_mgr_get_config(&cfg);
+    if (ret != ESP_OK) {
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_ERROR, NULL, 0);
+        return;
+    }
+    /* Mask password */
+    uint8_t  buf[WIFI_MGR_SSID_MAX + WIFI_MGR_PASS_MAX + 4];
+    size_t   n = 0;
+    uint8_t  ssid_len = (uint8_t)strlen(cfg.ssid);
+    uint8_t  pass_len = (uint8_t)strlen(cfg.password);
+    buf[n++] = ssid_len;
+    memcpy(&buf[n], cfg.ssid, ssid_len);   n += ssid_len;
+    buf[n++] = pass_len;
+    memset(&buf[n], '*', pass_len);        n += pass_len;
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, n);
+}
+
+static void handle_wifi_connect(const proto_frame_t *f)
+{
+    esp_err_t ret = wifi_mgr_connect();
+    cdc_send_response(f->seq, f->cmd,
+                      ret == ESP_OK ? PROTO_STATUS_OK : PROTO_STATUS_ERROR,
+                      NULL, 0);
+}
+
+static void handle_wifi_disconnect(const proto_frame_t *f)
+{
+    esp_err_t ret = wifi_mgr_disconnect();
+    cdc_send_response(f->seq, f->cmd,
+                      ret == ESP_OK ? PROTO_STATUS_OK : PROTO_STATUS_ERROR,
+                      NULL, 0);
+}
+
+static void handle_wifi_get_status(const proto_frame_t *f)
+{
+    wifi_mgr_status_t st;
+    wifi_mgr_get_status(&st);
+    uint8_t buf[6];
+    buf[0] = (uint8_t)st.state;
+    memcpy(&buf[1], st.ip, 4);
+    buf[5] = (uint8_t)st.rssi;   /* int8_t reinterpreted as uint8_t */
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, sizeof(buf));
+}
+
+static void handle_wifi_scan(const proto_frame_t *f)
+{
+    wifi_mgr_ap_info_t *aps = malloc(sizeof(wifi_mgr_ap_info_t) * WIFI_MGR_SCAN_MAX);
+    if (!aps) {
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_ERROR, NULL, 0);
+        return;
+    }
+
+    int count = wifi_mgr_scan(aps, WIFI_MGR_SCAN_MAX);
+    if (count < 0) {
+        free(aps);
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_ERROR, NULL, 0);
+        return;
+    }
+
+    /* Build payload: [count:1]([ssid_len:1][ssid][rssi:1][auth:1])* */
+    uint8_t buf[PROTO_MAX_PAYLOAD];
+    size_t  n = 0;
+    buf[n++] = (uint8_t)count;
+    for (int i = 0; i < count && n < sizeof(buf) - 3; i++) {
+        uint8_t slen = (uint8_t)strlen(aps[i].ssid);
+        if (n + 1 + slen + 2 > sizeof(buf)) break;
+        buf[n++] = slen;
+        memcpy(&buf[n], aps[i].ssid, slen);  n += slen;
+        buf[n++] = (uint8_t)aps[i].rssi;
+        buf[n++] = aps[i].authmode;
+    }
+
+    free(aps);
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, n);
+}
+
+/* ── Frame dispatcher (runs in cmd_task context) ── */
+
+static void on_frame(const proto_frame_t *f, void *ctx)
+{
+    ESP_LOGD(TAG, "CMD=0x%02X SEQ=%u payload_len=%u", f->cmd, f->seq, f->payload_len);
+
+    switch ((proto_cmd_t)f->cmd) {
+    case CMD_PING:              handle_ping(f);              break;
+    case CMD_GET_DEV_INFO:      handle_get_dev_info(f);      break;
+    case CMD_RESET:             handle_reset(f);             break;
+    case CMD_WIFI_SET_CONFIG:   handle_wifi_set_config(f);   break;
+    case CMD_WIFI_GET_CONFIG:   handle_wifi_get_config(f);   break;
+    case CMD_WIFI_CONNECT:      handle_wifi_connect(f);      break;
+    case CMD_WIFI_DISCONNECT:   handle_wifi_disconnect(f);   break;
+    case CMD_WIFI_GET_STATUS:   handle_wifi_get_status(f);   break;
+    case CMD_WIFI_SCAN:         handle_wifi_scan(f);         break;
+    default:
+        ESP_LOGW(TAG, "Unknown CMD=0x%02X", f->cmd);
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
         break;
     }
 }
 
-/* Overlay a small progress bar at the bottom of the current state display.
- * percent: 0–100.  Only called after the display-delay threshold. */
-static void display_show_long_press(uint8_t percent)
-{
-    if (xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(0)) != pdTRUE) return;
-    u8g2_ClearBuffer(&u8g2);
-    draw_state_content();
-    /* Thin label + bar at the bottom (y=50..63) */
-    u8g2_DrawStr(&u8g2, 0, 50, "Hold: reset WiFi");
-    /* bar outline: x=0 y=54 w=128 h=6 */
-    u8g2_DrawFrame(&u8g2, 0, 54, 128, 6);
-    uint8_t fill = (uint8_t)(((uint32_t)126 * percent) / 100);
-    if (fill > 0) u8g2_DrawBox(&u8g2, 1, 55, fill, 4);
-    u8g2_SendBuffer(&u8g2);
-    xSemaphoreGive(s_disp_mutex);
-}
+/* ── Command processing task ── */
 
-/* Restore display to match the current app state (called after cancelled long-press). */
-static void restore_display_for_state(void)
+static void cmd_task(void *arg)
 {
-    switch (s_state) {
-    case APP_STATE_IDLE:
-        display_show("WiFi Provisioner", "Ready", NULL, "[Click] Start");
-        break;
-    case APP_STATE_CONNECTING:
-        display_show("Connecting...", "Using saved creds", NULL, "[Click] Stop");
-        break;
-    case APP_STATE_CONNECTED: {
-        wifi_ap_record_t ap_info = {};
-        int rssi = -100;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) rssi = ap_info.rssi;
-        display_show_connected(rssi);
-        break;
-    }
-    case APP_STATE_PORTAL:
-        display_show("Portal Active", wf_config.ap_ssid, "Connect & open", "[Click] Stop");
-        break;
-    case APP_STATE_RETRY_WAIT:
-        display_show("Connect Failed", "Retrying...", NULL, "[Hold 3s] Reset WiFi");
-        break;
-    }
-}
+    proto_parser_t *parser = proto_parser_create(on_frame, NULL);
+    uint8_t         buf[CDC_RX_BUF_SIZE];
 
-/* Called with s_disp_mutex already held. */
-static void draw_signal_bars(int rssi)
-{
-    /* How many bars to fill: ≥-55 → 4, ≥-65 → 3, ≥-75 → 2, ≥-85 → 1, else 0 */
-    int filled;
-    if      (rssi >= -55) filled = 4;
-    else if (rssi >= -65) filled = 3;
-    else if (rssi >= -75) filled = 2;
-    else if (rssi >= -85) filled = 1;
-    else                  filled = 0;
-
-    /* 4 bars × 3 px wide, 1 px gap; bottom edge at y=12, heights 4/6/8/10 */
-    static const struct { uint8_t x; uint8_t y; uint8_t h; } bars[4] = {
-        {111,  8, 4},
-        {115,  6, 6},
-        {119,  4, 8},
-        {123,  2, 10},
-    };
-    for (int i = 0; i < 4; i++) {
-        if (i < filled) {
-            u8g2_DrawBox(&u8g2, bars[i].x, bars[i].y, 3, bars[i].h);
-        } else {
-            u8g2_DrawFrame(&u8g2, bars[i].x, bars[i].y, 3, bars[i].h);
+    while (1) {
+        size_t n = xStreamBufferReceive(s_cmd_stream, buf, sizeof(buf),
+                                        portMAX_DELAY);
+        if (n > 0) {
+            proto_parser_feed(parser, buf, n);
         }
     }
 }
 
-static void display_show(const char *line1, const char *line2,
-                          const char *line3, const char *hint)
+/* ── USB CDC callbacks ── */
+
+static void usb_cdc_rx_callback(int itf, cdcacm_event_t *event)
 {
-    if (xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-    u8g2_ClearBuffer(&u8g2);
-    if (line1) u8g2_DrawStr(&u8g2, 0, 10, line1);
-    if (line2) u8g2_DrawStr(&u8g2, 0, 22, line2);
-    if (line3) u8g2_DrawStr(&u8g2, 0, 34, line3);
-    if (hint) {
-        u8g2_DrawHLine(&u8g2, 0, 48, 128);
-        u8g2_DrawStr(&u8g2, 0, 62, hint);
-    }
-    u8g2_SendBuffer(&u8g2);
-    xSemaphoreGive(s_disp_mutex);
-}
+    uint8_t   tmp[CDC_RX_BUF_SIZE];
+    size_t    rx_size = 0;
 
-/* Connected-specific display: signal bars + IP + RSSI value */
-static void display_show_connected(int rssi)
-{
-    char rssi_str[14];
-    snprintf(rssi_str, sizeof(rssi_str), "RSSI: %d dBm", rssi);
+    esp_err_t ret = tinyusb_cdcacm_read(itf, tmp, sizeof(tmp), &rx_size);
+    if (ret != ESP_OK || rx_size == 0) return;
 
-    if (xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-    u8g2_ClearBuffer(&u8g2);
-    u8g2_DrawStr(&u8g2,  0, 10, "Connected!");
-    draw_signal_bars(rssi);                      /* top-right corner */
-    u8g2_DrawStr(&u8g2,  0, 22, s_connected_ip);
-    u8g2_DrawStr(&u8g2,  0, 34, rssi_str);
-    u8g2_DrawHLine(&u8g2, 0, 48, 128);
-    u8g2_DrawStr(&u8g2,  0, 62, "[Hold 3s] Reset");
-    u8g2_SendBuffer(&u8g2);
-    xSemaphoreGive(s_disp_mutex);
-}
+    atomic_store(&s_data_active, 1);
 
-/* Retry-wait display: show remaining seconds until next attempt. */
-static void display_show_retry(uint32_t remaining_s)
-{
-    char countdown[20];
-    snprintf(countdown, sizeof(countdown), "Retry in %lus...", (unsigned long)remaining_s);
-    display_show("Connect Failed", countdown, NULL, "[Hold 3s] Reset WiFi");
-}
-
-/* ── WiFi callbacks (event-loop task — only update display / post cmds) ── */
-
-static void on_connected(void)
-{
-    esp_netif_ip_info_t ip = {};
-    strncpy(s_connected_ip, "No IP", sizeof(s_connected_ip));
-    if (wifi_prov_get_ip_info(&ip) == ESP_OK) {
-        snprintf(s_connected_ip, sizeof(s_connected_ip), IPSTR, IP2STR(&ip.ip));
-    }
-
-    wifi_ap_record_t ap_info = {};
-    int rssi = -100;
-    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-        rssi = ap_info.rssi;
-    }
-
-    ESP_LOGI(TAG, "WiFi connected – IP: %s  RSSI: %d dBm", s_connected_ip, rssi);
-    s_state = APP_STATE_CONNECTED;
-    display_show_connected(rssi);
-}
-
-static void on_disconnected(void *arg, esp_event_base_t base,
-                             int32_t event_id, void *event_data)
-{
-    /* Only react if we were actually connected (ignore spurious events). */
-    if (s_state != APP_STATE_CONNECTED) return;
-    ESP_LOGW(TAG, "WiFi disconnected – scheduling reconnect");
-    s_state = APP_STATE_CONNECTING;
-    display_show("Disconnected", "Reconnecting...", NULL, "[Click] Stop");
-    app_cmd_t cmd = CMD_DISCONNECTED;
-    xQueueSend(s_cmd_queue, &cmd, 0);
-}
-
-static void on_connect_failed(void)
-{
-    app_cmd_t cmd;
-    if (s_state == APP_STATE_CONNECTING) {
-        /* Stored-creds connect failed — schedule a background retry. */
-        ESP_LOGW(TAG, "Connection failed – will retry in %d s",
-                 RETRY_INTERVAL_MS / 1000);
-        cmd = CMD_CONNECT_FAILED;
-    } else {
-        /* Portal submission failed — stay on portal, notify user. */
-        ESP_LOGW(TAG, "Portal auth failed");
-        display_show("Auth Failed", "Wrong password?", "Try again", "[Click] Stop");
-        cmd = CMD_AUTH_FAILED;
-    }
-    xQueueSend(s_cmd_queue, &cmd, 0);
-}
-
-static void on_portal_start(void)
-{
-    /* Display already set before wifi_prov_start() is called from main task. */
-}
-
-static void on_credentials(const char *ssid, const char *password)
-{
-    ESP_LOGI(TAG, "Portal credentials received – connecting to \"%s\"", ssid);
-    display_show("Connecting...", ssid, NULL, "[Click] Stop");
-    wifi_prov_connect_with_creds(ssid, password);
-}
-
-/* ── Long-press progress timer ───────────────────────────────────────── */
-
-/* Only start rendering the progress bar after this delay (ms).
- * Shorter presses are single clicks and should not show any overlay. */
-#define LONG_PRESS_DISPLAY_DELAY_MS  500
-
-static void progress_timer_cb(void *arg)
-{
-    if (!s_in_long_press || s_long_press_done) return;
-    uint32_t elapsed = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - s_press_down_tick);
-    if (elapsed < LONG_PRESS_DISPLAY_DELAY_MS) return; /* too early – might be a click */
-    s_progress_shown = true;
-    if (elapsed > LONG_PRESS_TIME_MS) elapsed = LONG_PRESS_TIME_MS;
-    uint8_t percent = (uint8_t)((elapsed * 100) / LONG_PRESS_TIME_MS);
-    display_show_long_press(percent);
-    /* Fallback: if threshold reached but BUTTON_LONG_PRESS_START hasn't fired yet */
-    if (percent >= 100 && !s_long_press_done) {
-        s_long_press_done = true;
-        s_in_long_press   = false;
-        esp_timer_stop(s_progress_timer);
-        ESP_LOGI(TAG, "Long press (timer fallback) → RESET");
-        app_cmd_t cmd = CMD_RESET;
-        xQueueSend(s_cmd_queue, &cmd, 0);
+    /* Forward to command task via StreamBuffer (non-blocking) */
+    size_t sent = xStreamBufferSend(s_cmd_stream, tmp, rx_size, 0);
+    if (sent < rx_size) {
+        ESP_LOGW(TAG, "Stream buffer full, %u byte(s) dropped",
+                 (unsigned)(rx_size - sent));
     }
 }
 
-/* ── Button callbacks (timer task — only post commands) ──────────────── */
-
-static void button_press_down_cb(void *arg, void *usr_data)
+static void usb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
 {
-    s_press_down_tick = xTaskGetTickCount();
-    s_long_press_done = false;
-    s_in_long_press   = true;
-    s_progress_shown  = false;
-    /* Do NOT update display here – wait for the display-delay threshold in the
-     * timer callback so that quick single-clicks see no flicker at all. */
-    esp_timer_start_periodic(s_progress_timer, 200 * 1000 /* 200 ms */);
+    atomic_store(&s_data_active, 1);
+    ESP_LOGI(TAG, "Line state itf %d: DTR=%d RTS=%d", itf,
+             event->line_state_changed_data.dtr,
+             event->line_state_changed_data.rts);
 }
 
-static void button_press_up_cb(void *arg, void *usr_data)
-{
-    s_in_long_press = false;
-    if (s_long_press_done) return; /* threshold already reached, action triggered */
-    esp_timer_stop(s_progress_timer);
-    restore_display_for_state();
-}
-
-static void button_single_click_cb(void *arg, void *usr_data)
-{
-    /* Progress bar was shown but not completed → cancelled long-press, not a click. */
-    if (s_progress_shown && !s_long_press_done) return;
-    app_cmd_t cmd = (s_state == APP_STATE_IDLE) ? CMD_START : CMD_STOP;
-    ESP_LOGI(TAG, "Single click → %s", cmd == CMD_START ? "START" : "STOP");
-    xQueueSend(s_cmd_queue, &cmd, 0);
-}
-
-static void button_long_press_start_cb(void *arg, void *usr_data)
-{
-    s_long_press_done = true;
-    s_in_long_press   = false;
-    esp_timer_stop(s_progress_timer);
-    display_show_long_press(100); /* show full bar momentarily */
-    ESP_LOGI(TAG, "Long press → RESET");
-    app_cmd_t cmd = CMD_RESET;
-    xQueueSend(s_cmd_queue, &cmd, 0);
-}
-
-/* ── Helpers called from main task only ──────────────────────────────── */
-
-static void do_start_portal(void)
-{
-    s_state = APP_STATE_PORTAL;
-    display_show("Portal Active", wf_config.ap_ssid,
-                 "Connect & open", "[Click] Stop");
-    wifi_prov_start(&wf_config);
-}
-
-static void do_connect(void)
-{
-    s_state = APP_STATE_CONNECTING;
-    s_connect_start_tick = xTaskGetTickCount();
-    display_show("Connecting...", "Using saved creds", NULL, "[Click] Stop");
-
-    esp_err_t err = wifi_prov_connect(&wf_config);
-    if (err == ESP_ERR_NOT_FOUND) {
-        /* No stored credentials — tell user to long-press for setup. */
-        ESP_LOGI(TAG, "No stored credentials");
-        s_state = APP_STATE_IDLE;
-        display_show("No Credentials", "Hold to setup WiFi", NULL, "[Hold 3s] Setup");
-    } else if (err != ESP_OK) {
-        /* Immediate failure — fall into the retry path. */
-        app_cmd_t fc = CMD_CONNECT_FAILED;
-        xQueueSend(s_cmd_queue, &fc, 0);
-    }
-    /* ESP_OK → async; on_connected / on_connect_failed will fire. */
-}
-
-/* ── Init ────────────────────────────────────────────────────────────── */
-
-static void init_u8g2(void)
-{
-    u8g2_esp32_hal_t hal = U8G2_ESP32_HAL_DEFAULT;
-    hal.bus.i2c.sda = GPIO_NUM_8;
-    hal.bus.i2c.scl = GPIO_NUM_9;
-    u8g2_esp32_hal_init(hal);
-    u8x8_SetI2CAddress(&u8g2.u8x8, 0x78);
-    u8g2_Setup_sh1106_i2c_128x64_noname_f(&u8g2, U8G2_R0,
-        u8g2_esp32_i2c_byte_cb, u8g2_esp32_gpio_and_delay_cb);
-    u8g2_SetFont(&u8g2, u8g2_font_5x7_t_cyrillic);
-    u8g2_InitDisplay(&u8g2);
-    u8g2_SetPowerSave(&u8g2, 0);
-    u8g2_ClearDisplay(&u8g2);
-}
-
-/* ── Main ────────────────────────────────────────────────────────────── */
+/* ── app_main ── */
 
 void app_main(void)
 {
-    s_disp_mutex = xSemaphoreCreateMutex();
-    s_cmd_queue  = xQueueCreate(8, sizeof(app_cmd_t));
-
-    init_u8g2();
-
-    /* Configure provisioner */
-    wf_config.ap_ssid           = "MyDevice-Setup";
-    wf_config.on_connected      = on_connected;
-    wf_config.on_connect_failed = on_connect_failed;
-    wf_config.on_portal_start   = on_portal_start;
-    wf_config.on_credentials    = on_credentials;
-
-    /* Long-press progress timer (created once, started/stopped per press) */
-    const esp_timer_create_args_t timer_args = {
-        .callback = progress_timer_cb,
-        .name     = "lp_progress",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_progress_timer));
-
-    /* Button */
-    const button_config_t btn_cfg = {
-        .long_press_time  = LONG_PRESS_TIME_MS,
-        .short_press_time = 100,
-    };
-    const button_gpio_config_t btn_gpio_cfg = {
-        .gpio_num     = BUTTON_GPIO_NUM,
-        .active_level = BUTTON_ACTIVE_LEVEL,
-        .disable_pull = false,
-    };
-    button_handle_t btn = NULL;
-    ESP_ERROR_CHECK(iot_button_new_gpio_device(&btn_cfg, &btn_gpio_cfg, &btn));
-    iot_button_register_cb(btn, BUTTON_PRESS_DOWN,       NULL, button_press_down_cb,       NULL);
-    iot_button_register_cb(btn, BUTTON_PRESS_UP,         NULL, button_press_up_cb,         NULL);
-    iot_button_register_cb(btn, BUTTON_SINGLE_CLICK,     NULL, button_single_click_cb,     NULL);
-    iot_button_register_cb(btn, BUTTON_LONG_PRESS_START, NULL, button_long_press_start_cb, NULL);
-
-    ESP_ERROR_CHECK(wifi_prov_init());
-
-    ESP_ERROR_CHECK(esp_event_handler_register(
-        WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_disconnected, NULL));
-    button_single_click_cb(0,0);
-    ESP_LOGI(TAG, "Ready – press GPIO%d to start", BUTTON_GPIO_NUM);
-
-    /* ── Command loop ─────────────────────────────────────────────────── */
-    app_cmd_t cmd;
-    while (1) {
-        if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            /* Timeout tick ─────────────────────────────────────────────── */
-
-            /* Refresh signal strength when connected (skip while progress bar is up). */
-            if (s_state == APP_STATE_CONNECTED && !s_in_long_press) {
-                wifi_ap_record_t ap_info = {};
-                if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-                    display_show_connected(ap_info.rssi);
-                }
-            }
-
-            /* Safety-net: if stuck in CONNECTING too long, treat as failure. */
-            if (s_state == APP_STATE_CONNECTING &&
-                (xTaskGetTickCount() - s_connect_start_tick) >=
-                    pdMS_TO_TICKS(CONNECT_TIMEOUT_MS)) {
-                ESP_LOGW(TAG, "Connection timeout – scheduling retry");
-                wifi_prov_stop();
-                cmd = CMD_CONNECT_FAILED;
-                goto handle_cmd;
-            }
-
-            /* Retry countdown: fire connect when interval elapses. */
-            if (s_state == APP_STATE_RETRY_WAIT) {
-                TickType_t elapsed = xTaskGetTickCount() - s_retry_start_tick;
-                if (elapsed >= pdMS_TO_TICKS(RETRY_INTERVAL_MS)) {
-                    ESP_LOGI(TAG, "Retrying WiFi connection…");
-                    do_connect();
-                } else {
-                    uint32_t remaining_ms = RETRY_INTERVAL_MS
-                                           - (uint32_t)pdTICKS_TO_MS(elapsed);
-                    display_show_retry((remaining_ms + 999) / 1000);
-                }
-            }
-
-            continue;
-        }
-
-handle_cmd:
-        switch (cmd) {
-
-        case CMD_START:
-            do_connect();
-            break;
-
-        case CMD_STOP:
-            wifi_prov_stop();
-            s_state = APP_STATE_IDLE;
-            display_show("Idle", "", NULL, "[Click] Start");
-            break;
-
-        case CMD_RESET:
-            wifi_prov_stop();
-            wifi_prov_erase_credentials();
-            do_start_portal();
-            break;
-
-        case CMD_CONNECT_FAILED:
-            /* Guard: only enter retry-wait if we were actually connecting.
-               Prevents a stale event from firing after CMD_STOP. */
-            if (s_state == APP_STATE_CONNECTING) {
-                s_state = APP_STATE_RETRY_WAIT;
-                s_retry_start_tick = xTaskGetTickCount();
-                display_show_retry(RETRY_INTERVAL_MS / 1000);
-            }
-            break;
-
-        case CMD_AUTH_FAILED:
-            /* Portal stays active; display already updated in callback. */
-            s_state = APP_STATE_PORTAL;
-            break;
-
-        case CMD_DISCONNECTED:
-            /* State was already set to CONNECTING in on_disconnected();
-             * just (re-)invoke do_connect() to start the actual attempt. */
-            ESP_LOGI(TAG, "Reconnecting after disconnect…");
-            do_connect();
-            break;
-        }
+    /* NVS */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
+    ESP_ERROR_CHECK(ret);
+
+    /* LED GPIO */
+    gpio_config_t io_cfg = {
+        .pin_bit_mask = (1ULL << LED_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_cfg);
+    gpio_set_level(LED_GPIO, 0);
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = led_timer_cb,
+        .name     = "led",
+    };
+    esp_timer_handle_t led_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &led_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(led_timer, LED_TIMER_PERIOD_US));
+
+    /* WiFi */
+    ESP_ERROR_CHECK(wifi_mgr_init());
+
+    /* StreamBuffer for CDC → cmd_task */
+    s_cmd_stream = xStreamBufferCreate(CMD_STREAM_SIZE, 1);
+    xTaskCreate(cmd_task, "cmd", 4096, NULL, 5, NULL);
+
+    /* TinyUSB */
+    const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+
+    const tinyusb_config_cdcacm_t acm_cfg = {
+        .cdc_port                     = TINYUSB_CDC_ACM_0,
+        .callback_rx                  = usb_cdc_rx_callback,
+        .callback_rx_wanted_char      = NULL,
+        .callback_line_state_changed  = usb_cdc_line_state_changed_callback,
+        .callback_line_coding_changed = NULL,
+    };
+    ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
+
+    ESP_LOGI(TAG, "Ready. Waiting for commands on USB CDC.");
 }

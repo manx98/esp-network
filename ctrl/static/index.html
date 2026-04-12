@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 控制台</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f0f2f5; color: #1a1a2e; min-height: 100vh; }
+  header { background: #16213e; color: #fff; padding: 1rem 1.5rem; display: flex; align-items: center; gap: 1rem; }
+  header h1 { font-size: 1.2rem; font-weight: 600; }
+  .badge { padding: .25rem .6rem; border-radius: 999px; font-size: .75rem; font-weight: 600; }
+  .badge.ok { background: #22c55e; color: #fff; }
+  .badge.err { background: #ef4444; color: #fff; }
+  .badge.warn { background: #f59e0b; color: #fff; }
+  main { max-width: 860px; margin: 1.5rem auto; padding: 0 1rem; display: grid; gap: 1rem; }
+  .card { background: #fff; border-radius: .75rem; padding: 1.25rem 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; color: #16213e; border-bottom: 1px solid #e5e7eb; padding-bottom: .5rem; }
+  .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: .3rem; flex: 1; min-width: 180px; }
+  label { font-size: .8rem; font-weight: 500; color: #6b7280; }
+  input { padding: .45rem .7rem; border: 1px solid #d1d5db; border-radius: .4rem; font-size: .9rem; width: 100%; }
+  input:focus { outline: 2px solid #3b82f6; border-color: transparent; }
+  button { padding: .45rem 1rem; border: none; border-radius: .4rem; cursor: pointer; font-size: .85rem; font-weight: 500; transition: opacity .15s; white-space: nowrap; }
+  button:hover { opacity: .85; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-primary { background: #3b82f6; color: #fff; }
+  .btn-success { background: #22c55e; color: #fff; }
+  .btn-danger  { background: #ef4444; color: #fff; }
+  .btn-warn    { background: #f59e0b; color: #fff; }
+  .btn-gray    { background: #6b7280; color: #fff; }
+  .info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: .75rem; }
+  .info-item { background: #f8fafc; border-radius: .5rem; padding: .6rem .8rem; }
+  .info-item .k { font-size: .72rem; color: #6b7280; margin-bottom: .2rem; }
+  .info-item .v { font-size: .9rem; font-weight: 600; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  th { text-align: left; padding: .4rem .6rem; background: #f8fafc; color: #6b7280; font-weight: 500; font-size: .75rem; border-bottom: 1px solid #e5e7eb; }
+  td { padding: .45rem .6rem; border-bottom: 1px solid #f1f5f9; }
+  tr:last-child td { border-bottom: none; }
+  tr.selected td { background: #eff6ff; }
+  tr:hover td { background: #f8fafc; cursor: pointer; }
+  .rssi-bar { display: inline-block; height: 8px; border-radius: 4px; background: #3b82f6; }
+  .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; padding: .75rem 1.25rem; border-radius: .5rem; color: #fff; font-size: .85rem; font-weight: 500; z-index: 999; transition: opacity .3s; }
+  .toast.hide { opacity: 0; pointer-events: none; }
+  .toast.ok { background: #22c55e; }
+  .toast.err { background: #ef4444; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: .3rem; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32 控制台</h1>
+  <span id="devBadge" class="badge err">未连接</span>
+  <span id="wifiBadge" class="badge err" style="margin-left:auto">WiFi: --</span>
+</header>
+
+<main>
+  <!-- System -->
+  <div class="card">
+    <h2>系统</h2>
+    <div class="row">
+      <button class="btn-primary" onclick="doPing()">Ping</button>
+      <button class="btn-gray"    onclick="doInfo()">设备信息</button>
+      <button class="btn-danger"  onclick="doReset()">重启设备</button>
+    </div>
+    <div id="sysInfo" class="info-grid" style="margin-top:.75rem"></div>
+  </div>
+
+  <!-- WiFi Config -->
+  <div class="card">
+    <h2>WiFi 配置</h2>
+    <div class="row">
+      <div class="field">
+        <label>SSID</label>
+        <input id="inSSID" type="text" placeholder="网络名称" maxlength="32">
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input id="inPass" type="password" placeholder="密码" maxlength="64">
+      </div>
+      <button class="btn-primary" onclick="doSetConfig()">保存</button>
+      <button class="btn-gray"    onclick="doGetConfig()">读取</button>
+    </div>
+  </div>
+
+  <!-- WiFi Control -->
+  <div class="card">
+    <h2>WiFi 连接</h2>
+    <div class="row" style="margin-bottom:.75rem">
+      <button class="btn-success" onclick="doConnect()">连接</button>
+      <button class="btn-danger"  onclick="doDisconnect()">断开</button>
+      <button class="btn-gray"    onclick="doGetStatus()">刷新状态</button>
+    </div>
+    <div id="wifiStatus" class="info-grid"></div>
+  </div>
+
+  <!-- Scan -->
+  <div class="card">
+    <h2>WiFi 扫描</h2>
+    <div class="row" style="margin-bottom:.75rem">
+      <button class="btn-primary" id="btnScan" onclick="doScan()">开始扫描</button>
+      <span id="scanHint" style="font-size:.8rem;color:#6b7280">点击结果行可自动填入 SSID</span>
+    </div>
+    <table id="scanTable">
+      <thead><tr><th>SSID</th><th>信号强度</th><th>加密</th></tr></thead>
+      <tbody id="scanBody"></tbody>
+    </table>
+  </div>
+</main>
+
+<div id="toast" class="toast hide"></div>
+
+<script>
+const authNames = ['开放','WEP','WPA-PSK','WPA2-PSK','WPA/WPA2-PSK','企业','WPA3','WPA2/WPA3'];
+
+async function api(method, path, body) {
+  const opts = { method, headers: {'Content-Type':'application/json'} };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+function toast(msg, type='ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `toast ${type}`;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.add('hide'), 3000);
+}
+
+function infoGrid(container, items) {
+  container.innerHTML = items.map(([k, v]) =>
+    `<div class="info-item"><div class="k">${k}</div><div class="v">${v}</div></div>`
+  ).join('');
+}
+
+// ── Poll device + WiFi status every 3 s ─────────────────────────────────────
+async function pollStatus() {
+  try {
+    const [dev, wifi] = await Promise.all([
+      api('GET', '/api/status'),
+      api('GET', '/api/wifi/status').catch(() => null),
+    ]);
+
+    const devBadge = document.getElementById('devBadge');
+    devBadge.textContent = dev.connected ? '已连接' : '未连接';
+    devBadge.className = 'badge ' + (dev.connected ? 'ok' : 'err');
+
+    const wifiBadge = document.getElementById('wifiBadge');
+    if (wifi && !wifi.error) {
+      const names = ['断开','连接中','已连接','失败'];
+      wifiBadge.textContent = 'WiFi: ' + (names[wifi.state] || '未知');
+      wifiBadge.className = 'badge ' + (wifi.state === 2 ? 'ok' : wifi.state === 1 ? 'warn' : 'err');
+      renderWifiStatus(wifi);
+    }
+  } catch {}
+}
+
+function rssiLabel(rssi) {
+  if (rssi >= -50) return `${rssi} dBm（极强）`;
+  if (rssi >= -65) return `${rssi} dBm（强）`;
+  if (rssi >= -75) return `${rssi} dBm（一般）`;
+  return `${rssi} dBm（弱）`;
+}
+
+function renderWifiStatus(s) {
+  const names = ['断开','连接中','已连接','失败'];
+  const items = [
+    ['状态', names[s.state] || '未知'],
+    ['IP 地址', s.state === 2 ? s.ip : '--'],
+  ];
+  if (s.state === 2 && s.rssi !== undefined) {
+    items.push(['信号强度', rssiLabel(s.rssi)]);
+  }
+  infoGrid(document.getElementById('wifiStatus'), items);
+}
+
+setInterval(pollStatus, 3000);
+pollStatus();
+
+// ── System ───────────────────────────────────────────────────────────────────
+async function doPing() {
+  const r = await api('GET', '/api/ping');
+  if (r.error) { toast(r.error, 'err'); return; }
+  toast('Pong: ' + r.pong);
+}
+
+async function doInfo() {
+  const r = await api('GET', '/api/info');
+  if (r.error) { toast(r.error, 'err'); return; }
+  infoGrid(document.getElementById('sysInfo'), [['固件信息', r.info]]);
+  toast('已获取设备信息');
+}
+
+async function doReset() {
+  if (!confirm('确认重启设备？')) return;
+  await api('POST', '/api/reset');
+  toast('已发送重启命令');
+}
+
+// ── WiFi config ──────────────────────────────────────────────────────────────
+async function doSetConfig() {
+  const ssid = document.getElementById('inSSID').value.trim();
+  const password = document.getElementById('inPass').value;
+  if (!ssid) { toast('请输入 SSID', 'err'); return; }
+  const r = await api('POST', '/api/wifi/config', { ssid, password });
+  if (r.error) { toast(r.error, 'err'); return; }
+  toast('配置已保存');
+}
+
+async function doGetConfig() {
+  const r = await api('GET', '/api/wifi/config');
+  if (r.error) { toast(r.error, 'err'); return; }
+  document.getElementById('inSSID').value = r.ssid;
+  document.getElementById('inPass').value = r.password;
+  toast('配置已读取');
+}
+
+// ── WiFi control ─────────────────────────────────────────────────────────────
+async function doConnect() {
+  const r = await api('POST', '/api/wifi/connect');
+  if (r.error) { toast(r.error, 'err'); return; }
+  toast('连接命令已发送，正在连接…', 'ok');
+  setTimeout(doGetStatus, 3000);
+}
+
+async function doDisconnect() {
+  const r = await api('POST', '/api/wifi/disconnect');
+  if (r.error) { toast(r.error, 'err'); return; }
+  toast('已断开');
+  doGetStatus();
+}
+
+async function doGetStatus() {
+  const r = await api('GET', '/api/wifi/status');
+  if (r.error) { toast(r.error, 'err'); return; }
+  renderWifiStatus(r);
+}
+
+// ── Scan ─────────────────────────────────────────────────────────────────────
+async function doScan() {
+  const btn = document.getElementById('btnScan');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>扫描中…';
+  document.getElementById('scanBody').innerHTML = '';
+
+  try {
+    const r = await api('GET', '/api/wifi/scan');
+    if (r.error) { toast(r.error, 'err'); return; }
+
+    const tbody = document.getElementById('scanBody');
+    if (!r.aps || r.aps.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#9ca3af">未找到网络</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = r.aps.map(ap => {
+      const pct = Math.max(0, Math.min(100, 2 * (ap.rssi + 100)));
+      const color = pct > 60 ? '#22c55e' : pct > 30 ? '#f59e0b' : '#ef4444';
+      const auth = authNames[ap.authmode] || '未知';
+      return `<tr onclick="selectAP('${escHtml(ap.ssid)}')">
+        <td>${escHtml(ap.ssid)}</td>
+        <td><span class="rssi-bar" style="width:${pct}px;background:${color}"></span> ${ap.rssi} dBm</td>
+        <td>${auth}</td>
+      </tr>`;
+    }).join('');
+
+    toast(`发现 ${r.aps.length} 个网络`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '开始扫描';
+  }
+}
+
+function selectAP(ssid) {
+  document.getElementById('inSSID').value = ssid;
+  document.getElementById('inPass').focus();
+  toast('已选择: ' + ssid);
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

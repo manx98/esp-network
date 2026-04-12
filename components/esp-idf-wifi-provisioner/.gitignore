@@ -1,9 +1,0 @@
-.claude
-build/
-sdkconfig
-sdkconfig.old
-managed_components/
-dependencies.lock
-.clangd
-.vscode/
-examples/basic/.cache
