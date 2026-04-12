@@ -13,11 +13,19 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_timer.h"
 
+static void display_show(const char *line1, const char *line2,
+                          const char *line3, const char *hint);
+
+static void display_show_connected(int rssi);
+
+static void draw_signal_bars(int rssi);
 /* ── Hardware ────────────────────────────────────────────────────────── */
 
 #define BUTTON_GPIO_NUM     GPIO_NUM_21
 #define BUTTON_ACTIVE_LEVEL 1
+#define LONG_PRESS_TIME_MS  3000   /* must match button_config_t.long_press_time */
 
 /* ── Globals ─────────────────────────────────────────────────────────── */
 
@@ -27,6 +35,14 @@ static u8g2_t              u8g2;
 static wifi_prov_config_t  wf_config = WIFI_PROV_DEFAULT_CONFIG();
 static SemaphoreHandle_t   s_disp_mutex;
 static QueueHandle_t       s_cmd_queue;
+
+/* ── Long-press progress state ───────────────────────────────────────── */
+
+static esp_timer_handle_t  s_progress_timer  = NULL;
+static TickType_t          s_press_down_tick  = 0;
+static volatile bool       s_in_long_press    = false; /* progress bar showing  */
+static volatile bool       s_long_press_done  = false; /* threshold was reached */
+static volatile bool       s_progress_shown   = false; /* bar was rendered ≥1 frame */
 
 /* ── App state ───────────────────────────────────────────────────────── */
 
@@ -46,7 +62,7 @@ static TickType_t s_connect_start_tick = 0;
 
 /* Tick count when entering RETRY_WAIT; controls next retry. */
 static TickType_t s_retry_start_tick = 0;
-#define RETRY_INTERVAL_MS   30000
+#define RETRY_INTERVAL_MS   5000
 
 /* IP cached at connect-time; refreshed by periodic RSSI updates */
 static char s_connected_ip[20] = {0};
@@ -59,6 +75,7 @@ typedef enum {
     CMD_RESET,           /* button: erase creds + open portal */
     CMD_CONNECT_FAILED,  /* callback: connection attempt failed */
     CMD_AUTH_FAILED,     /* callback: portal submission failed, stay on portal */
+    CMD_DISCONNECTED,    /* callback: WiFi link lost while connected */
 } app_cmd_t;
 
 /* ── Display ─────────────────────────────────────────────────────────── */
@@ -74,6 +91,81 @@ typedef enum {
  * Connected layout adds signal bars at top-right (x=111..126, y=2..12):
  *   4 bars, bottom-aligned, filled = strong / outline = weak
  */
+
+/* Draw current-state content into the buffer (mutex must already be held). */
+static void draw_state_content(void)
+{
+    switch (s_state) {
+    case APP_STATE_IDLE:
+        u8g2_DrawStr(&u8g2, 0, 10, "WiFi Provisioner");
+        u8g2_DrawStr(&u8g2, 0, 22, "Ready");
+        break;
+    case APP_STATE_CONNECTING:
+        u8g2_DrawStr(&u8g2, 0, 10, "Connecting...");
+        u8g2_DrawStr(&u8g2, 0, 22, "Using saved creds");
+        break;
+    case APP_STATE_CONNECTED: {
+        wifi_ap_record_t ap_info = {};
+        int rssi = -100;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) rssi = ap_info.rssi;
+        u8g2_DrawStr(&u8g2, 0, 10, "Connected!");
+        draw_signal_bars(rssi);
+        u8g2_DrawStr(&u8g2, 0, 22, s_connected_ip);
+        break;
+    }
+    case APP_STATE_PORTAL:
+        u8g2_DrawStr(&u8g2, 0, 10, "Portal Active");
+        u8g2_DrawStr(&u8g2, 0, 22, wf_config.ap_ssid);
+        break;
+    case APP_STATE_RETRY_WAIT:
+        u8g2_DrawStr(&u8g2, 0, 10, "Connect Failed");
+        u8g2_DrawStr(&u8g2, 0, 22, "Retrying...");
+        break;
+    }
+}
+
+/* Overlay a small progress bar at the bottom of the current state display.
+ * percent: 0–100.  Only called after the display-delay threshold. */
+static void display_show_long_press(uint8_t percent)
+{
+    if (xSemaphoreTake(s_disp_mutex, pdMS_TO_TICKS(0)) != pdTRUE) return;
+    u8g2_ClearBuffer(&u8g2);
+    draw_state_content();
+    /* Thin label + bar at the bottom (y=50..63) */
+    u8g2_DrawStr(&u8g2, 0, 50, "Hold: reset WiFi");
+    /* bar outline: x=0 y=54 w=128 h=6 */
+    u8g2_DrawFrame(&u8g2, 0, 54, 128, 6);
+    uint8_t fill = (uint8_t)(((uint32_t)126 * percent) / 100);
+    if (fill > 0) u8g2_DrawBox(&u8g2, 1, 55, fill, 4);
+    u8g2_SendBuffer(&u8g2);
+    xSemaphoreGive(s_disp_mutex);
+}
+
+/* Restore display to match the current app state (called after cancelled long-press). */
+static void restore_display_for_state(void)
+{
+    switch (s_state) {
+    case APP_STATE_IDLE:
+        display_show("WiFi Provisioner", "Ready", NULL, "[Click] Start");
+        break;
+    case APP_STATE_CONNECTING:
+        display_show("Connecting...", "Using saved creds", NULL, "[Click] Stop");
+        break;
+    case APP_STATE_CONNECTED: {
+        wifi_ap_record_t ap_info = {};
+        int rssi = -100;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) rssi = ap_info.rssi;
+        display_show_connected(rssi);
+        break;
+    }
+    case APP_STATE_PORTAL:
+        display_show("Portal Active", wf_config.ap_ssid, "Connect & open", "[Click] Stop");
+        break;
+    case APP_STATE_RETRY_WAIT:
+        display_show("Connect Failed", "Retrying...", NULL, "[Hold 3s] Reset WiFi");
+        break;
+    }
+}
 
 /* Called with s_disp_mutex already held. */
 static void draw_signal_bars(int rssi)
@@ -165,6 +257,18 @@ static void on_connected(void)
     display_show_connected(rssi);
 }
 
+static void on_disconnected(void *arg, esp_event_base_t base,
+                             int32_t event_id, void *event_data)
+{
+    /* Only react if we were actually connected (ignore spurious events). */
+    if (s_state != APP_STATE_CONNECTED) return;
+    ESP_LOGW(TAG, "WiFi disconnected – scheduling reconnect");
+    s_state = APP_STATE_CONNECTING;
+    display_show("Disconnected", "Reconnecting...", NULL, "[Click] Stop");
+    app_cmd_t cmd = CMD_DISCONNECTED;
+    xQueueSend(s_cmd_queue, &cmd, 0);
+}
+
 static void on_connect_failed(void)
 {
     app_cmd_t cmd;
@@ -194,17 +298,68 @@ static void on_credentials(const char *ssid, const char *password)
     wifi_prov_connect_with_creds(ssid, password);
 }
 
+/* ── Long-press progress timer ───────────────────────────────────────── */
+
+/* Only start rendering the progress bar after this delay (ms).
+ * Shorter presses are single clicks and should not show any overlay. */
+#define LONG_PRESS_DISPLAY_DELAY_MS  500
+
+static void progress_timer_cb(void *arg)
+{
+    if (!s_in_long_press || s_long_press_done) return;
+    uint32_t elapsed = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - s_press_down_tick);
+    if (elapsed < LONG_PRESS_DISPLAY_DELAY_MS) return; /* too early – might be a click */
+    s_progress_shown = true;
+    if (elapsed > LONG_PRESS_TIME_MS) elapsed = LONG_PRESS_TIME_MS;
+    uint8_t percent = (uint8_t)((elapsed * 100) / LONG_PRESS_TIME_MS);
+    display_show_long_press(percent);
+    /* Fallback: if threshold reached but BUTTON_LONG_PRESS_START hasn't fired yet */
+    if (percent >= 100 && !s_long_press_done) {
+        s_long_press_done = true;
+        s_in_long_press   = false;
+        esp_timer_stop(s_progress_timer);
+        ESP_LOGI(TAG, "Long press (timer fallback) → RESET");
+        app_cmd_t cmd = CMD_RESET;
+        xQueueSend(s_cmd_queue, &cmd, 0);
+    }
+}
+
 /* ── Button callbacks (timer task — only post commands) ──────────────── */
+
+static void button_press_down_cb(void *arg, void *usr_data)
+{
+    s_press_down_tick = xTaskGetTickCount();
+    s_long_press_done = false;
+    s_in_long_press   = true;
+    s_progress_shown  = false;
+    /* Do NOT update display here – wait for the display-delay threshold in the
+     * timer callback so that quick single-clicks see no flicker at all. */
+    esp_timer_start_periodic(s_progress_timer, 200 * 1000 /* 200 ms */);
+}
+
+static void button_press_up_cb(void *arg, void *usr_data)
+{
+    s_in_long_press = false;
+    if (s_long_press_done) return; /* threshold already reached, action triggered */
+    esp_timer_stop(s_progress_timer);
+    restore_display_for_state();
+}
 
 static void button_single_click_cb(void *arg, void *usr_data)
 {
+    /* Progress bar was shown but not completed → cancelled long-press, not a click. */
+    if (s_progress_shown && !s_long_press_done) return;
     app_cmd_t cmd = (s_state == APP_STATE_IDLE) ? CMD_START : CMD_STOP;
     ESP_LOGI(TAG, "Single click → %s", cmd == CMD_START ? "START" : "STOP");
     xQueueSend(s_cmd_queue, &cmd, 0);
 }
 
-static void button_long_press_cb(void *arg, void *usr_data)
+static void button_long_press_start_cb(void *arg, void *usr_data)
 {
+    s_long_press_done = true;
+    s_in_long_press   = false;
+    esp_timer_stop(s_progress_timer);
+    display_show_long_press(100); /* show full bar momentarily */
     ESP_LOGI(TAG, "Long press → RESET");
     app_cmd_t cmd = CMD_RESET;
     xQueueSend(s_cmd_queue, &cmd, 0);
@@ -273,9 +428,16 @@ void app_main(void)
     wf_config.on_portal_start   = on_portal_start;
     wf_config.on_credentials    = on_credentials;
 
+    /* Long-press progress timer (created once, started/stopped per press) */
+    const esp_timer_create_args_t timer_args = {
+        .callback = progress_timer_cb,
+        .name     = "lp_progress",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_progress_timer));
+
     /* Button */
     const button_config_t btn_cfg = {
-        .long_press_time  = 3000,
+        .long_press_time  = LONG_PRESS_TIME_MS,
         .short_press_time = 100,
     };
     const button_gpio_config_t btn_gpio_cfg = {
@@ -285,12 +447,16 @@ void app_main(void)
     };
     button_handle_t btn = NULL;
     ESP_ERROR_CHECK(iot_button_new_gpio_device(&btn_cfg, &btn_gpio_cfg, &btn));
-    iot_button_register_cb(btn, BUTTON_SINGLE_CLICK,   NULL, button_single_click_cb, NULL);
-    iot_button_register_cb(btn, BUTTON_LONG_PRESS_UP,  NULL, button_long_press_cb,   NULL);
+    iot_button_register_cb(btn, BUTTON_PRESS_DOWN,       NULL, button_press_down_cb,       NULL);
+    iot_button_register_cb(btn, BUTTON_PRESS_UP,         NULL, button_press_up_cb,         NULL);
+    iot_button_register_cb(btn, BUTTON_SINGLE_CLICK,     NULL, button_single_click_cb,     NULL);
+    iot_button_register_cb(btn, BUTTON_LONG_PRESS_START, NULL, button_long_press_start_cb, NULL);
 
     ESP_ERROR_CHECK(wifi_prov_init());
 
-    display_show("WiFi Provisioner", "Ready", NULL, "[Click] Start");
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_disconnected, NULL));
+    button_single_click_cb(0,0);
     ESP_LOGI(TAG, "Ready – press GPIO%d to start", BUTTON_GPIO_NUM);
 
     /* ── Command loop ─────────────────────────────────────────────────── */
@@ -299,8 +465,8 @@ void app_main(void)
         if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(2000)) != pdTRUE) {
             /* Timeout tick ─────────────────────────────────────────────── */
 
-            /* Refresh signal strength when connected. */
-            if (s_state == APP_STATE_CONNECTED) {
+            /* Refresh signal strength when connected (skip while progress bar is up). */
+            if (s_state == APP_STATE_CONNECTED && !s_in_long_press) {
                 wifi_ap_record_t ap_info = {};
                 if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
                     display_show_connected(ap_info.rssi);
@@ -365,6 +531,13 @@ handle_cmd:
         case CMD_AUTH_FAILED:
             /* Portal stays active; display already updated in callback. */
             s_state = APP_STATE_PORTAL;
+            break;
+
+        case CMD_DISCONNECTED:
+            /* State was already set to CONNECTING in on_disconnected();
+             * just (re-)invoke do_connect() to start the actual attempt. */
+            ESP_LOGI(TAG, "Reconnecting after disconnect…");
+            do_connect();
             break;
         }
     }
