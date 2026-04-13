@@ -139,8 +139,6 @@ func (s *Server) handleConn(client net.Conn) {
 		sendReply(client, repConnRefused)
 		return
 	}
-	defer tcpConn.Close()
-
 	// Success reply: BND.ADDR = 0.0.0.0, BND.PORT = 0
 	sendReply(client, repSuccess)
 
@@ -178,7 +176,10 @@ func (s *Server) handleConn(client net.Conn) {
 		}
 	}()
 
-	<-done
+	<-done                    // one direction finished
+	tcpConn.Close()           // unblocks the ESP32→client goroutine (recvCh closed)
+	client.Close()            // unblocks the client→ESP32 goroutine (Read returns error)
+	<-done                    // wait for the other direction to exit
 	slog.Debug("socks5 relay done", "host", host, "port", port)
 }
 

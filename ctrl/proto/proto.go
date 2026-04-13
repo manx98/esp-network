@@ -44,7 +44,9 @@ const (
 	CmdTCPConnect    Cmd = 0x20 // [host_len:1][host:N][port_hi:1][port_lo:1] → [conn_id:1]
 	CmdTCPSend       Cmd = 0x21 // [conn_id:1][data...] (fire-and-forget, no response)
 	CmdTCPClose      Cmd = 0x22 // [conn_id:1] → OK
-	CmdTcpConnectAck Cmd = 0x23
+	CmdTcpConnectAck  Cmd = 0x23
+	CmdTCPConnectDone Cmd = 0x26 // push: [conn_id:1][status:1]  0=ok, errno lo-byte=fail
+	CmdTCPSendCredit  Cmd = 0x27 // push: [conn_id:1][credits_hi:1][credits_lo:1]
 
 	// Push frames from ESP32 (IsResp=false, unsolicited)
 	CmdTCPDataPush   Cmd = 0x40 // [conn_id:1][data...]

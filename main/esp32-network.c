@@ -37,8 +37,12 @@ static void led_timer_cb(void *arg)
 
 /* ── CDC ── */
 #define CDC_RX_BUF_SIZE    512
-#define CDC_TX_CHUNK       512   /* TinyUSB CDC TX ring-buffer size */
-#define CMD_STREAM_SIZE    4096   /* StreamBuffer for RX bytes → cmd task */
+/* Match CONFIG_TINYUSB_CDC_TX_BUFSIZE (4096) — write large chunks to amortise
+ * per-write overhead and keep the USB TX ring-buffer well-fed. */
+#define CDC_TX_CHUNK       4096
+/* Larger stream buffer so the USB RX ISR never drops bytes at peak load.
+ * Sized to hold ~20 max-payload frames while cmd_task is busy. */
+#define CMD_STREAM_SIZE    8192
 #define RESP_BUF_SIZE      (PROTO_MAX_PAYLOAD + 32)
 #define PUSH_BUF_SIZE      (PROTO_MAX_PAYLOAD + 32)
 
@@ -316,7 +320,7 @@ static void handle_tcp_connect(const proto_frame_t *f)
 
     uint16_t port = ((uint16_t)p[0] << 8) | p[1];
 
-    int conn_id = tcp_mgr_connect(host, port);
+    int conn_id = tcp_mgr_connect_async(host, port);
     if (conn_id == -2) {
         cdc_send_response(f->seq, f->cmd, PROTO_STATUS_BUSY, NULL, 0);
         return;
@@ -335,14 +339,12 @@ bad_arg:
 
 static void handle_tcp_send(const proto_frame_t *f)
 {
-    /* payload: [conn_id:1][data...] — no response sent */
+    /* payload: [conn_id:1][data...] — no response sent.
+     * Send errors are handled by tcp_send_task, which closes the
+     * connection and pushes CMD_TCP_CLOSED_PUSH autonomously. */
     if (f->payload_len < 2) return;
     uint8_t conn_id = f->payload[0];
-    if (tcp_mgr_send(conn_id, &f->payload[1], f->payload_len - 1) == -1)
-    {
-        tcp_mgr_close(conn_id);
-        cdc_send_push(CMD_TCP_CLOSED_PUSH, &conn_id, 1);
-    }
+    tcp_mgr_send(conn_id, &f->payload[1], f->payload_len - 1);
 }
 
 static void handle_tcp_connect_ack(const proto_frame_t *f)
@@ -399,7 +401,7 @@ static void cmd_task(void *arg)
         size_t n = xStreamBufferReceive(s_cmd_stream, buf, sizeof(buf),
                                         portMAX_DELAY);
         if (n > 0) {
-            ESP_LOGI(TAG, "Received %d bytes", n);
+            ESP_LOGD(TAG, "Received %d bytes", n);
             proto_parser_feed(parser, buf, n);
         }
     }

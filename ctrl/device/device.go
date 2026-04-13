@@ -23,7 +23,11 @@ const (
 	readBufSize    = 512
 	defaultTimeout = 15 * time.Second
 	tcpConnTimeout = 15 * time.Second
-	tcpMaxConns    = 8
+	tcpMaxConns    = 16
+	// initialCredit must match TCP_SNDBUF on the ESP32 side (tcp_mgr.c).
+	// Seeds the credit window so ctrl can immediately fill the socket send
+	// buffer without waiting for the first CMD_TCP_SEND_CREDIT push.
+	initialCredit  = 5760
 )
 
 var (
@@ -37,8 +41,31 @@ var (
 type TCPConn struct {
 	id     byte
 	dev    *Device
-	recvCh chan []byte // closed when the remote end closes the connection
-	once   sync.Once
+	recvCh chan []byte // closed via shutdownOnce
+	// shutdownOnce closes recvCh and wakes blocked writers; used by
+	// both the explicit Close() path and the device-push path.
+	shutdownOnce sync.Once
+	// cmdCloseOnce guards the single CMD_TCP_CLOSE transmission.
+	cmdCloseOnce sync.Once
+
+	// Credit flow control (T11)
+	creditMu   sync.Mutex
+	creditCond *sync.Cond
+	credit     int
+	closed     bool
+}
+
+// shutdown tears down the local side of the connection: closes recvCh
+// so Read returns io.EOF, and wakes any Write blocked on credit.
+// Safe to call multiple times.
+func (c *TCPConn) shutdown() {
+	c.shutdownOnce.Do(func() {
+		c.creditMu.Lock()
+		c.closed = true
+		c.creditCond.Broadcast()
+		c.creditMu.Unlock()
+		close(c.recvCh)
+	})
 }
 
 // Read blocks until the device pushes data for this connection,
@@ -53,6 +80,7 @@ func (c *TCPConn) Read() ([]byte, error) {
 
 // Write sends data through the ESP32 to the remote TCP peer.
 // Large payloads are automatically split into protocol-sized chunks.
+// Each chunk waits for sufficient send credit before transmission.
 func (c *TCPConn) Write(data []byte) error {
 	const maxChunk = proto.MaxPayload - 1 // 1 byte reserved for conn_id
 	for len(data) > 0 {
@@ -60,6 +88,19 @@ func (c *TCPConn) Write(data []byte) error {
 		if n > maxChunk {
 			n = maxChunk
 		}
+
+		// Wait until we have credit for this chunk (T11).
+		c.creditMu.Lock()
+		for c.credit < n && !c.closed {
+			c.creditCond.Wait()
+		}
+		if c.closed {
+			c.creditMu.Unlock()
+			return errors.New("connection closed")
+		}
+		c.credit -= n
+		c.creditMu.Unlock()
+
 		payload := make([]byte, 1+n)
 		payload[0] = c.id
 		copy(payload[1:], data[:n])
@@ -72,10 +113,15 @@ func (c *TCPConn) Write(data []byte) error {
 }
 
 // Close tears down the TCP connection on the device side.
+// Idempotent; safe to call from multiple goroutines.
 func (c *TCPConn) Close() error {
+	// Unblock any blocked Read/Write immediately.
+	c.shutdown()
+	c.dev.unregisterTCPConn(c.id)
+
+	// Send CMD_TCP_CLOSE exactly once.
 	var err error
-	c.once.Do(func() {
-		c.dev.unregisterTCPConn(c.id)
+	c.cmdCloseOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, err = c.dev.Send(ctx, proto.CmdTCPClose, []byte{c.id})
@@ -101,6 +147,10 @@ type Device struct {
 	tcpMu    sync.Mutex
 	tcpConns map[byte]*TCPConn
 
+	// Pending async TCP connect channels (T9)
+	connectMu      sync.Mutex
+	pendingConnect map[byte]chan error
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -110,12 +160,13 @@ type Device struct {
 func New(portName string, baudRate int) *Device {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Device{
-		portName: portName,
-		baudRate: baudRate,
-		pending:  make(map[byte]chan proto.Frame),
-		tcpConns: make(map[byte]*TCPConn),
-		ctx:      ctx,
-		cancel:   cancel,
+		portName:       portName,
+		baudRate:       baudRate,
+		pending:        make(map[byte]chan proto.Frame),
+		tcpConns:       make(map[byte]*TCPConn),
+		pendingConnect: make(map[byte]chan error),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 }
 
@@ -164,10 +215,18 @@ func (d *Device) Close() {
 	}
 	d.pendingMu.Unlock()
 
-	// Close all open TCP connections.
+	// Unblock any goroutine waiting for a TCP connect result.
+	d.connectMu.Lock()
+	for id, ch := range d.pendingConnect {
+		ch <- ErrNotConnected
+		delete(d.pendingConnect, id)
+	}
+	d.connectMu.Unlock()
+
+	// Close all open TCP connections and wake blocked writers.
 	d.tcpMu.Lock()
 	for id, conn := range d.tcpConns {
-		close(conn.recvCh)
+		conn.shutdown()
 		delete(d.tcpConns, id)
 	}
 	d.tcpMu.Unlock()
@@ -250,6 +309,8 @@ func (d *Device) writeFrameNoReply(cmd proto.Cmd, payload []byte) error {
 }
 
 // TCPConnect opens a TCP connection via the ESP32 and returns a TCPConn.
+// The connection attempt happens asynchronously on the device; this function
+// waits for CMD_TCP_CONNECT_DONE before returning (T9).
 func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 	hostBytes := []byte(host)
 	if len(hostBytes) > 253 {
@@ -264,6 +325,8 @@ func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), tcpConnTimeout)
 	defer cancel()
 
+	// Step 1: Send CMD_TCP_CONNECT — device allocates a slot and responds
+	// with the conn_id immediately (async connect queued on device).
 	f, err := d.Send(ctx, proto.CmdTCPConnect, payload)
 	if err != nil {
 		return nil, fmt.Errorf("tcp connect %s:%d: %w", host, port, err)
@@ -274,19 +337,50 @@ func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 	if len(f.Payload) < 1 {
 		return nil, errors.New("tcp connect: short response")
 	}
-
 	connID := f.Payload[0]
+
+	// Step 2: Register a channel to receive the async connect result.
+	doneCh := make(chan error, 1)
+	d.connectMu.Lock()
+	d.pendingConnect[connID] = doneCh
+	d.connectMu.Unlock()
+	defer func() {
+		d.connectMu.Lock()
+		delete(d.pendingConnect, connID)
+		d.connectMu.Unlock()
+	}()
+
+	// Step 3: Wait for CMD_TCP_CONNECT_DONE push.
+	select {
+	case connectErr := <-doneCh:
+		if connectErr != nil {
+			return nil, fmt.Errorf("tcp connect %s:%d: %w", host, port, connectErr)
+		}
+	case <-ctx.Done():
+		// Timed out — tell ESP32 to free the slot so it isn't occupied for 60 s.
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer closeCancel()
+		d.Send(closeCtx, proto.CmdTCPClose, []byte{connID}) //nolint:errcheck
+		return nil, fmt.Errorf("tcp connect %s:%d: timeout waiting for connect done", host, port)
+	case <-d.ctx.Done():
+		return nil, ErrNotConnected
+	}
+
+	// Step 4: Connection succeeded — create TCPConn with seed credit (T11).
 	conn := &TCPConn{
 		id:     connID,
 		dev:    d,
 		recvCh: make(chan []byte, 64),
+		credit: initialCredit,
 	}
+	conn.creditCond = sync.NewCond(&conn.creditMu)
 
 	d.tcpMu.Lock()
 	d.tcpConns[connID] = conn
 	d.tcpMu.Unlock()
-	err = d.writeFrameNoReply(proto.CmdTcpConnectAck, []byte{connID})
-	if err != nil {
+
+	// Step 5: Send ACK so ESP32's rx task starts delivering data.
+	if err := d.writeFrameNoReply(proto.CmdTcpConnectAck, []byte{connID}); err != nil {
 		d.unregisterTCPConn(connID)
 		return nil, fmt.Errorf("ack tcp connect error: %w", err)
 	}
@@ -330,8 +424,41 @@ func (d *Device) dispatchPush(f proto.Frame) {
 		delete(d.tcpConns, connID)
 		d.tcpMu.Unlock()
 		if conn != nil {
-			close(conn.recvCh)
+			conn.shutdown()
 			slog.Debug("tcp conn closed by device", "conn", connID)
+		}
+
+	case proto.CmdTCPConnectDone: // T9: async connect result
+		if len(f.Payload) < 2 {
+			return
+		}
+		connID, status := f.Payload[0], f.Payload[1]
+		d.connectMu.Lock()
+		ch := d.pendingConnect[connID]
+		delete(d.pendingConnect, connID)
+		d.connectMu.Unlock()
+		if ch != nil {
+			if status == 0 {
+				ch <- nil
+			} else {
+				ch <- fmt.Errorf("connect failed: errno %d", status)
+			}
+		}
+
+	case proto.CmdTCPSendCredit: // T11: replenish send credit
+		if len(f.Payload) < 3 {
+			return
+		}
+		connID := f.Payload[0]
+		credits := int(f.Payload[1])<<8 | int(f.Payload[2])
+		d.tcpMu.Lock()
+		conn := d.tcpConns[connID]
+		d.tcpMu.Unlock()
+		if conn != nil {
+			conn.creditMu.Lock()
+			conn.credit += credits
+			conn.creditCond.Broadcast()
+			conn.creditMu.Unlock()
 		}
 	}
 }

@@ -14,7 +14,15 @@
 #include <stddef.h>
 #include "proto.h"
 
-#define TCP_MAX_CONNS 1024
+/* Maximum simultaneous TCP connections.
+ * Set to match CONFIG_LWIP_MAX_SOCKETS(24) minus ~8 reserved for the WiFi
+ * stack (DHCP, DNS, management sockets). */
+#define TCP_MAX_CONNS       16
+
+/* Number of parallel tcp_connect_task workers.  On a single-core CPU each
+ * worker blocks independently in DNS + connect, so N workers allow N
+ * connection attempts to proceed simultaneously. */
+#define TCP_CONNECT_WORKERS  4
 
 /** Called from the tcp_rx_task to deliver data/events to the host */
 typedef void (*tcp_push_cb_t)(uint8_t cmd, const uint8_t *data, size_t len);
@@ -26,14 +34,17 @@ typedef void (*tcp_push_cb_t)(uint8_t cmd, const uint8_t *data, size_t len);
 void tcp_mgr_init(tcp_push_cb_t push_cb);
 
 /**
- * Open a TCP connection to host:port.
+ * Asynchronously open a TCP connection to host:port.
+ * Allocates a connection slot immediately and enqueues the connect
+ * request.  The result is delivered as a CMD_TCP_CONNECT_DONE push
+ * frame once the connection attempt completes.
  *
  * @param host      Null-terminated hostname or IPv4 dotted-decimal string
  * @param port      Target TCP port (host byte order)
  * @return          Connection id 0–(TCP_MAX_CONNS-1) on success,
  *                  -1 on general error, -2 if all slots are busy
  */
-int tcp_mgr_connect(const char *host, uint16_t port);
+int tcp_mgr_connect_async(const char *host, uint16_t port);
 
 int tcp_mgr_ready(uint8_t conn_id);
 

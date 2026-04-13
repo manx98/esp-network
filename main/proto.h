@@ -49,7 +49,9 @@ typedef enum {
     CMD_TCP_CONNECT     = 0x20,  /* [host_len:1][host:N][port_hi:1][port_lo:1] → [conn_id:1] */
     CMD_TCP_SEND        = 0x21,  /* [conn_id:1][data...] (no response) */
     CMD_TCP_CLOSE       = 0x22,  /* [conn_id:1] → OK */
-    CMD_TCP_CONNECT_ACK = 0x23,
+    CMD_TCP_CONNECT_ACK  = 0x23,
+    CMD_TCP_CONNECT_DONE = 0x26,  /* push: [conn_id:1][status:1]  0=ok, errno lo-byte=fail */
+    CMD_TCP_SEND_CREDIT  = 0x27,  /* push: [conn_id:1][credits_hi:1][credits_lo:1] */
 
     /* Push frames (ESP32 → host, unsolicited, no RESP_FLAG) */
     CMD_TCP_DATA_PUSH   = 0x40,  /* [conn_id:1][data...] */
