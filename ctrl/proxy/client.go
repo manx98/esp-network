@@ -264,7 +264,7 @@ func (c *Client) readLoop() {
 		}
 		headerRemain := cap(header) - len(header)
 		if headerRemain > 0 {
-			if headerRemain >= len(last) {
+			if headerRemain > len(last) {
 				header = append(header, last...)
 				last = nil
 			} else {
@@ -276,7 +276,7 @@ func (c *Client) readLoop() {
 		}
 		payLoadRemain := cap(payLoad) - len(payLoad)
 		if payLoadRemain >= 0 {
-			if payLoadRemain >= len(last) {
+			if payLoadRemain > len(last) {
 				payLoad = append(payLoad, last...)
 				last = nil
 			} else {
