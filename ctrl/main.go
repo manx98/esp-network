@@ -5,8 +5,10 @@ import (
 	"flag"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/manx98/esp32-ctrl/api"
 	"github.com/manx98/esp32-ctrl/device"
@@ -17,11 +19,12 @@ import (
 var staticFiles embed.FS
 
 func main() {
-	port      := flag.String("port",   "/dev/ttyACM0", "Serial port (e.g. /dev/ttyACM0 or COM3)")
-	baud      := flag.Int("baud",    115200,          "Baud rate")
-	addr      := flag.String("addr",  ":8080",         "HTTP listen address")
-	socks5Addr := flag.String("socks5", ":1080",       "SOCKS5 proxy listen address (empty to disable)")
-	debug     := flag.Bool("debug",  false,            "Enable debug logging")
+	port := flag.String("port", "/dev/ttyACM0", "Serial port (e.g. /dev/ttyACM0 or COM3)")
+	baud := flag.Int("baud", 115200, "Baud rate")
+	addr := flag.String("addr", ":8080", "HTTP listen address")
+	socks5Addr := flag.String("socks5", ":1080", "SOCKS5 proxy listen address (empty to disable)")
+	proxyAddr := flag.String("proxy", "", "External proxy server address (e.g. localhost:11080)")
+	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -30,7 +33,6 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	// Open device (non-fatal: the web UI still loads even if the device is absent)
 	dev := device.New(*port, *baud)
 	if err := dev.Open(); err != nil {
 		slog.Warn("could not open serial port; UI will show 'not connected'",
@@ -38,9 +40,24 @@ func main() {
 	}
 	defer dev.Close()
 
-	// SOCKS5 proxy
 	if *socks5Addr != "" {
-		proxy := socks5.New(dev)
+		var proxy *socks5.Server
+		if *proxyAddr != "" {
+			slog.Info("using external proxy", "addr", *proxyAddr)
+			proxyHost, proxyPortStr, err := net.SplitHostPort(*proxyAddr)
+			var proxyPort int
+			if err == nil {
+				proxyPort, err = strconv.Atoi(proxyPortStr)
+			}
+			if err != nil {
+				slog.Warn("could not split proxy address", "addr", *proxyAddr, "err", err)
+				os.Exit(1)
+			}
+			proxy = socks5.NewWithProxy(dev, proxyHost, uint16(proxyPort))
+		} else {
+			slog.Info("using ESP32 direct connection")
+			proxy = socks5.New(dev)
+		}
 		go func() {
 			if err := proxy.ListenAndServe(*socks5Addr); err != nil {
 				slog.Error("socks5 proxy error", "err", err)
@@ -48,14 +65,11 @@ func main() {
 		}()
 	}
 
-	// HTTP mux
 	mux := http.NewServeMux()
 
-	// API routes
 	a := api.New(dev)
 	a.Register(mux)
 
-	// Static files (embedded)
 	staticFS, _ := fs.Sub(staticFiles, "static")
 	mux.Handle("/", http.FileServer(http.FS(staticFS)))
 
