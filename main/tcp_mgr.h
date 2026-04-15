@@ -1,63 +1,63 @@
 /*
- * tcp_mgr — TCP connection manager for SOCKS5 tunneling over serial
+ * tcp_mgr — Single long-lived TCP relay to a proxy server.
  *
- * Manages up to TCP_MAX_CONNS simultaneous TCP connections using the
- * ESP32 WiFi stack.  A background task reads from all open sockets
- * and delivers data/close events via the push callback.
+ * ESP32 maintains exactly one TCP connection to the configured proxy
+ * server.  The ctrl side is responsible for all proxy-protocol framing
+ * and connection multiplexing; ESP32's role is purely to relay bytes:
  *
- * Push callback format:
- *   CMD_TCP_DATA_PUSH   (0x40): payload = [conn_id:1][data...]
- *   CMD_TCP_CLOSED_PUSH (0x41): payload = [conn_id:1]
+ *   ctrl → CDC → ESP32 → TCP → proxy server   (via tcp_mgr_send)
+ *   proxy server → TCP → ESP32 → CDC → ctrl   (CMD_PROXY_DATA_PUSH)
+ *
+ * When the TCP connection is lost for any reason (remote close, network
+ * error, keepalive failure) a CMD_PROXY_CLOSED_PUSH frame is delivered
+ * to ctrl via the push callback.
+ *
+ * TCP keep-alive is enabled on the socket so dead connections are
+ * detected without application-level pinging (~30 s idle + 3×5 s probes).
  */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "proto.h"
 
-/* Maximum simultaneous TCP connections.
- * Set to match CONFIG_LWIP_MAX_SOCKETS(24) minus ~8 reserved for the WiFi
- * stack (DHCP, DNS, management sockets). */
-#define TCP_MAX_CONNS       16
-
-/* Number of parallel tcp_connect_task workers.  On a single-core CPU each
- * worker blocks independently in DNS + connect, so N workers allow N
- * connection attempts to proceed simultaneously. */
-#define TCP_CONNECT_WORKERS  4
-
-/** Called from the tcp_rx_task to deliver data/events to the host */
+/** Callback invoked from a background task to push data/events to ctrl. */
 typedef void (*tcp_push_cb_t)(uint8_t cmd, const uint8_t *data, size_t len);
 
 /**
- * Initialise the TCP manager and start the background rx task.
- * Must be called after WiFi is initialised.
+ * Initialise the relay and start background rx/send tasks.
+ * Must be called once after WiFi is initialised.
  */
 void tcp_mgr_init(tcp_push_cb_t push_cb);
 
 /**
- * Asynchronously open a TCP connection to host:port.
- * Allocates a connection slot immediately and enqueues the connect
- * request.  The result is delivered as a CMD_TCP_CONNECT_DONE push
- * frame once the connection attempt completes.
+ * Synchronously connect to the proxy server.
  *
- * @param host      Null-terminated hostname or IPv4 dotted-decimal string
- * @param port      Target TCP port (host byte order)
- * @return          Connection id 0–(TCP_MAX_CONNS-1) on success,
- *                  -1 on general error, -2 if all slots are busy
+ * Blocks the calling task for up to ~10 s (DNS + TCP connect timeout).
+ * Returns immediately with -2 if a connection is already open.
+ *
+ * @return  0   connected successfully
+ *          -1  connection failed (DNS, timeout, refused, …)
+ *          -2  already connected (busy)
  */
-int tcp_mgr_connect_async(const char *host, uint16_t port);
-
-int tcp_mgr_ready(uint8_t conn_id);
+int tcp_mgr_connect(const char *host, uint16_t port);
 
 /**
- * Send data on an open connection.
+ * Enqueue raw bytes for transmission to the proxy server.
+ * Returns immediately; the actual send happens in the background send task.
  *
- * @return  0 on success, -1 on error (connection probably dead)
+ * @return  0 on success, -1 on error (queue full, OOM, not connected)
  */
-int tcp_mgr_send(uint8_t conn_id, const uint8_t *data, size_t len);
+int tcp_mgr_send(const uint8_t *data, size_t len);
 
 /**
- * Close a connection and free the slot.
+ * Close the relay connection (if open) and notify ctrl via
+ * CMD_PROXY_CLOSED_PUSH.
  */
-void tcp_mgr_close(uint8_t conn_id);
+void tcp_mgr_disconnect(void);
 
+/** Returns true if the relay connection is currently up. */
+bool tcp_mgr_is_connected(void);
+
+/** Cumulative byte counters.  Thread-safe (atomic reads). */
 void tcp_mgr_get_bytes(uint64_t *rx_bytes, uint64_t *tx_bytes);

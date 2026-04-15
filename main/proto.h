@@ -45,17 +45,17 @@ typedef enum {
     CMD_WIFI_GET_STATUS = 0x14,  /* → [state:1][ip:4] */
     CMD_WIFI_SCAN       = 0x15,  /* → [count:1]([ssid_len:1][ssid][rssi:1][auth:1])* */
 
-    /* TCP tunneling (0x20–0x22) */
-    CMD_TCP_CONNECT     = 0x20,  /* [host_len:1][host:N][port_hi:1][port_lo:1] → [conn_id:1] */
-    CMD_TCP_SEND        = 0x21,  /* [conn_id:1][data...] (no response) */
-    CMD_TCP_CLOSE       = 0x22,  /* [conn_id:1] → OK */
-    CMD_TCP_CONNECT_ACK  = 0x23,
-    CMD_TCP_CONNECT_DONE = 0x26,  /* push: [conn_id:1][status:1]  0=ok, errno lo-byte=fail */
-    CMD_TCP_SEND_CREDIT  = 0x27,  /* push: [conn_id:1][credits_hi:1][credits_lo:1] */
+    /* Proxy relay — single long-lived TCP connection to proxy server (0x20–0x2F)
+     * ctrl multiplexes all traffic over this one connection using the proxy
+     * wire protocol; ESP32 is a transparent byte relay. */
+    CMD_PROXY_CONNECT    = 0x20,  /* [host_len:1][host:N][port_hi:1][port_lo:1] → OK/ERROR */
+    CMD_PROXY_SEND       = 0x21,  /* [data...] (fire-and-forget, no response) */
+    CMD_PROXY_DISCONNECT = 0x22,  /* → OK */
+    CMD_PROXY_GET_STATUS = 0x23,  /* → [connected:1] */
 
     /* Push frames (ESP32 → host, unsolicited, no RESP_FLAG) */
-    CMD_TCP_DATA_PUSH   = 0x40,  /* [conn_id:1][data...] */
-    CMD_TCP_CLOSED_PUSH = 0x41,  /* [conn_id:1] */
+    CMD_PROXY_DATA_PUSH   = 0x40,  /* [data...] — raw bytes from proxy server */
+    CMD_PROXY_CLOSED_PUSH = 0x41,  /* (no payload) — relay connection dropped */
 } proto_cmd_t;
 
 /* ── Status codes (first byte of every response payload) ── */

@@ -40,17 +40,16 @@ const (
 	CmdWifiGetStatus  Cmd = 0x14
 	CmdWifiScan       Cmd = 0x15
 
-	// TCP tunnelling (0x20–0x22)
-	CmdTCPConnect    Cmd = 0x20 // [host_len:1][host:N][port_hi:1][port_lo:1] → [conn_id:1]
-	CmdTCPSend       Cmd = 0x21 // [conn_id:1][data...] (fire-and-forget, no response)
-	CmdTCPClose      Cmd = 0x22 // [conn_id:1] → OK
-	CmdTcpConnectAck  Cmd = 0x23
-	CmdTCPConnectDone Cmd = 0x26 // push: [conn_id:1][status:1]  0=ok, errno lo-byte=fail
-	CmdTCPSendCredit  Cmd = 0x27 // push: [conn_id:1][credits_hi:1][credits_lo:1]
+	// Proxy relay — single long-lived TCP connection to the proxy server (0x20–0x2F).
+	// The ctrl side handles proxy-protocol framing; ESP32 is a transparent relay.
+	CmdProxyConnect    Cmd = 0x20 // [host_len:1][host:N][port_hi:1][port_lo:1] → OK/ERROR
+	CmdProxySend       Cmd = 0x21 // [data...] (fire-and-forget, no response)
+	CmdProxyDisconnect Cmd = 0x22 // → OK
+	CmdProxyGetStatus  Cmd = 0x23 // → [connected:1]
 
 	// Push frames from ESP32 (IsResp=false, unsolicited)
-	CmdTCPDataPush   Cmd = 0x40 // [conn_id:1][data...]
-	CmdTCPClosedPush Cmd = 0x41 // [conn_id:1]
+	CmdProxyDataPush   Cmd = 0x40 // [data...] — raw bytes from proxy server
+	CmdProxyClosedPush Cmd = 0x41 // (no payload) — relay connection dropped
 )
 
 // Status is the first byte of every response payload.

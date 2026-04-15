@@ -300,9 +300,9 @@ static void handle_wifi_scan(const proto_frame_t *f)
     cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, n);
 }
 
-/* ── TCP command handlers ─────────────────────────────────────────────────── */
+/* ── Proxy relay command handlers ────────────────────────────────────────── */
 
-static void handle_tcp_connect(const proto_frame_t *f)
+static void handle_proxy_connect(const proto_frame_t *f)
 {
     /* payload: [host_len:1][host:N][port_hi:1][port_lo:1] */
     const uint8_t *p   = f->payload;
@@ -320,47 +320,39 @@ static void handle_tcp_connect(const proto_frame_t *f)
 
     uint16_t port = ((uint16_t)p[0] << 8) | p[1];
 
-    int conn_id = tcp_mgr_connect_async(host, port);
-    if (conn_id == -2) {
+    /* Synchronous connect — blocks cmd_task for up to ~10 s. */
+    int ret = tcp_mgr_connect(host, port);
+    if (ret == -2) {
         cdc_send_response(f->seq, f->cmd, PROTO_STATUS_BUSY, NULL, 0);
         return;
     }
-    if (conn_id < 0) {
-        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_ERROR, NULL, 0);
-        return;
-    }
-    uint8_t resp[1] = {(uint8_t)conn_id};
-    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, resp, 1);
+    cdc_send_response(f->seq, f->cmd,
+                      ret == 0 ? PROTO_STATUS_OK : PROTO_STATUS_ERROR,
+                      NULL, 0);
     return;
 
 bad_arg:
     cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
 }
 
-static void handle_tcp_send(const proto_frame_t *f)
+static void handle_proxy_send(const proto_frame_t *f)
 {
-    /* payload: [conn_id:1][data...] — no response sent.
-     * Send errors are handled by tcp_send_task, which closes the
-     * connection and pushes CMD_TCP_CLOSED_PUSH autonomously. */
-    if (f->payload_len < 2) return;
-    uint8_t conn_id = f->payload[0];
-    tcp_mgr_send(conn_id, &f->payload[1], f->payload_len - 1);
+    /* payload: [data...] — raw bytes forwarded to proxy, no response.
+     * Errors are reported autonomously via CMD_PROXY_CLOSED_PUSH. */
+    if (f->payload_len == 0) return;
+    tcp_mgr_send(f->payload, f->payload_len);
 }
 
-static void handle_tcp_connect_ack(const proto_frame_t *f)
+static void handle_proxy_disconnect(const proto_frame_t *f)
 {
-    if (f->payload_len < 1) return;
-    tcp_mgr_ready(f->payload[0]);
-}
-
-static void handle_tcp_close(const proto_frame_t *f)
-{
-    if (f->payload_len < 1) {
-        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
-        return;
-    }
-    tcp_mgr_close(f->payload[0]);
+    tcp_mgr_disconnect();
     cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, NULL, 0);
+}
+
+static void handle_proxy_get_status(const proto_frame_t *f)
+{
+    uint8_t status = tcp_mgr_is_connected() ? 1 : 0;
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, &status, 1);
 }
 
 /* ── Frame dispatcher (runs in cmd_task context) ── */
@@ -370,19 +362,19 @@ static void on_frame(const proto_frame_t *f, void *ctx)
     ESP_LOGI(TAG, "CMD=0x%02X SEQ=%u payload_len=%u", f->cmd, f->seq, f->payload_len);
 
     switch ((proto_cmd_t)f->cmd) {
-    case CMD_PING:              handle_ping(f);              break;
-    case CMD_GET_DEV_INFO:      handle_get_dev_info(f);      break;
-    case CMD_RESET:             handle_reset(f);             break;
-    case CMD_WIFI_SET_CONFIG:   handle_wifi_set_config(f);   break;
-    case CMD_WIFI_GET_CONFIG:   handle_wifi_get_config(f);   break;
-    case CMD_WIFI_CONNECT:      handle_wifi_connect(f);      break;
-    case CMD_WIFI_DISCONNECT:   handle_wifi_disconnect(f);   break;
-    case CMD_WIFI_GET_STATUS:   handle_wifi_get_status(f);   break;
-    case CMD_WIFI_SCAN:         handle_wifi_scan(f);         break;
-    case CMD_TCP_CONNECT:       handle_tcp_connect(f);       break;
-    case CMD_TCP_SEND:          handle_tcp_send(f);          break;
-    case CMD_TCP_CONNECT_ACK:   handle_tcp_connect_ack(f);   break;
-    case CMD_TCP_CLOSE:         handle_tcp_close(f);         break;
+    case CMD_PING:               handle_ping(f);               break;
+    case CMD_GET_DEV_INFO:       handle_get_dev_info(f);       break;
+    case CMD_RESET:              handle_reset(f);              break;
+    case CMD_WIFI_SET_CONFIG:    handle_wifi_set_config(f);    break;
+    case CMD_WIFI_GET_CONFIG:    handle_wifi_get_config(f);    break;
+    case CMD_WIFI_CONNECT:       handle_wifi_connect(f);       break;
+    case CMD_WIFI_DISCONNECT:    handle_wifi_disconnect(f);    break;
+    case CMD_WIFI_GET_STATUS:    handle_wifi_get_status(f);    break;
+    case CMD_WIFI_SCAN:          handle_wifi_scan(f);          break;
+    case CMD_PROXY_CONNECT:      handle_proxy_connect(f);      break;
+    case CMD_PROXY_SEND:         handle_proxy_send(f);         break;
+    case CMD_PROXY_DISCONNECT:   handle_proxy_disconnect(f);   break;
+    case CMD_PROXY_GET_STATUS:   handle_proxy_get_status(f);   break;
     default:
         ESP_LOGW(TAG, "Unknown CMD=0x%02X", f->cmd);
         cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);

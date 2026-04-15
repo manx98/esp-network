@@ -1,5 +1,5 @@
-// Package socks5 implements a SOCKS5 proxy server that tunnels TCP traffic
-// either through the ESP32's WiFi or through an external proxy server.
+// Package socks5 implements a SOCKS5 proxy server that forwards traffic
+// through the external proxy server via the ESP32 relay connection.
 package socks5
 
 import (
@@ -9,63 +9,25 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/manx98/esp32-ctrl/device"
 	"github.com/manx98/esp32-ctrl/proxy"
 )
 
-const (
-	repSuccess          byte = 0x00
-	repGeneralFailure   byte = 0x01
-	repConnRefused      byte = 0x05
-	repCmdNotSupported  byte = 0x07
-	repAddrNotSupported byte = 0x08
-)
-
-type tcpConn interface {
-	Read(p []byte) (int, error)
-	Write(p []byte) (int, error)
-	Close() error
+// connector is satisfied by proxy.ProxyServer.
+type connector interface {
+	Connect(host string, port uint16) (io.ReadWriteCloser, error)
 }
 
-type deviceTCPConn struct {
-	conn *device.TCPConn
-}
-
-func (d *deviceTCPConn) Read(p []byte) (int, error) {
-	data, err := d.conn.Read()
-	if err != nil {
-		return 0, err
-	}
-	n := copy(p, data)
-	return n, nil
-}
-
-func (d *deviceTCPConn) Write(p []byte) (int, error) {
-	err := d.conn.Write(p)
-	if err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (d *deviceTCPConn) Close() error {
-	return d.conn.Close()
-}
-
+// Server is a SOCKS5 proxy that tunnels connections through the proxy server.
 type Server struct {
-	dev    *device.Device
-	proxyC *proxy.ProxyServer
+	proxy connector
 }
 
-func New(dev *device.Device) *Server {
-	return &Server{dev: dev}
+// New creates a SOCKS5 server backed by the given proxy server.
+func New(p *proxy.ProxyServer) *Server {
+	return &Server{proxy: p}
 }
 
-func NewWithProxy(dev *device.Device, proxyHost string, proxyPort uint16) *Server {
-	p := proxy.New(proxyHost, proxyPort, dev)
-	return &Server{dev: dev, proxyC: p}
-}
-
+// ListenAndServe starts listening on addr and handles connections.
 func (s *Server) ListenAndServe(addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -79,78 +41,69 @@ func (s *Server) ListenAndServe(addr string) error {
 		if err != nil {
 			return err
 		}
-		go s.handleConn(conn)
+		go s.handle(conn)
 	}
 }
 
-func (s *Server) handleConn(client net.Conn) {
+func (s *Server) handle(client net.Conn) {
 	defer client.Close()
 
+	// ── Handshake: auth method negotiation ──
 	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(client, hdr); err != nil {
+	if _, err := io.ReadFull(client, hdr); err != nil || hdr[0] != 0x05 {
 		return
 	}
-	if hdr[0] != 0x05 {
-		return
-	}
-	nMethods := int(hdr[1])
-	methods := make([]byte, nMethods)
+	methods := make([]byte, hdr[1])
 	if _, err := io.ReadFull(client, methods); err != nil {
 		return
 	}
-	hasNoAuth := false
+	// Accept no-auth only.
 	for _, m := range methods {
 		if m == 0x00 {
-			hasNoAuth = true
-			break
+			client.Write([]byte{0x05, 0x00})
+			goto request
 		}
 	}
-	if !hasNoAuth {
-		client.Write([]byte{0x05, 0xFF})
-		return
-	}
-	client.Write([]byte{0x05, 0x00})
+	client.Write([]byte{0x05, 0xFF})
+	return
 
+request:
+	// ── Request ──
 	req := make([]byte, 4)
-	if _, err := io.ReadFull(client, req); err != nil {
+	if _, err := io.ReadFull(client, req); err != nil || req[0] != 0x05 {
 		return
 	}
-	if req[0] != 0x05 {
+	if req[1] != 0x01 { // CONNECT only
+		sendReply(client, 0x07) // command not supported
 		return
 	}
-	cmd := req[1]
-	if cmd != 0x01 {
-		sendReply(client, repCmdNotSupported)
-		return
-	}
-	atyp := req[3]
 
 	var host string
-	switch atyp {
-	case 0x01:
+	switch req[3] {
+	case 0x01: // IPv4
 		addr := make([]byte, 4)
 		if _, err := io.ReadFull(client, addr); err != nil {
 			return
 		}
 		host = net.IP(addr).String()
-	case 0x03:
-		lenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(client, lenBuf); err != nil {
+	case 0x03: // domain
+		lbuf := make([]byte, 1)
+		if _, err := io.ReadFull(client, lbuf); err != nil {
 			return
 		}
-		domain := make([]byte, lenBuf[0])
+		domain := make([]byte, lbuf[0])
 		if _, err := io.ReadFull(client, domain); err != nil {
 			return
 		}
 		host = string(domain)
-	case 0x04:
+	case 0x04: // IPv6
 		addr := make([]byte, 16)
 		if _, err := io.ReadFull(client, addr); err != nil {
 			return
 		}
 		host = net.IP(addr).String()
 	default:
-		sendReply(client, repAddrNotSupported)
+		sendReply(client, 0x08) // address type not supported
 		return
 	}
 
@@ -162,47 +115,30 @@ func (s *Server) handleConn(client net.Conn) {
 
 	slog.Debug("socks5 connect", "host", host, "port", port)
 
-	var target io.ReadWriteCloser
-	var err error
-
-	if s.proxyC != nil {
-		target, err = s.proxyC.Connect(host, port)
-	} else {
-		var dc *device.TCPConn
-		dc, err = s.dev.TCPConnect(host, port)
-		if err == nil {
-			target = &deviceTCPConn{conn: dc}
-		}
-	}
-
+	target, err := s.proxy.Connect(host, port)
 	if err != nil {
-		slog.Warn("socks5 tcp connect failed", "host", host, "port", port, "err", err)
-		sendReply(client, repConnRefused)
+		slog.Warn("socks5: proxy connect failed", "host", host, "port", port, "err", err)
+		sendReply(client, 0x05) // connection refused
 		return
 	}
 	defer target.Close()
 
-	sendReply(client, repSuccess)
+	sendReply(client, 0x00) // success
 
+	// ── Relay ──
 	done := make(chan struct{}, 2)
-
 	go func() {
 		defer func() { done <- struct{}{} }()
-		_, _ = io.CopyBuffer(target, client, make([]byte, 1020))
+		io.Copy(target, client) //nolint:errcheck
 	}()
-
 	go func() {
 		defer func() { done <- struct{}{} }()
-		_, _ = io.CopyBuffer(client, target, make([]byte, 1020))
+		io.Copy(client, target) //nolint:errcheck
 	}()
-
 	<-done
-	_ = client.Close()
-	_ = target.Close()
-	<-done
-	slog.Debug("socks5 relay done", "host", host, "port", port)
 }
 
 func sendReply(w io.Writer, rep byte) {
-	w.Write([]byte{0x05, rep, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	// VER=5, REP, RSV=0, ATYP=1 (IPv4), BND.ADDR=0.0.0.0, BND.PORT=0
+	w.Write([]byte{0x05, rep, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) //nolint:errcheck
 }

@@ -1,5 +1,8 @@
-// Package proxy implements a client that connects to an external proxy server
-// and forwards SOCKS5 traffic through it.
+// Package proxy implements a multiplexed client over the single ESP32 relay
+// connection.  One TCPConn carries all virtual connections to the proxy server
+// using the wire protocol defined in proxy/main.go:
+//
+//	[cmd:1][connID:4 LE][payloadLen:2 LE][payload...]
 package proxy
 
 import (
@@ -9,382 +12,403 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/manx98/esp32-ctrl/device"
 )
 
+// Wire protocol commands (must match proxy/main.go).
 const (
-	CmdProxyConnect byte = iota
-	CmdProxyData
-	CmdProxyClose
-	CmdProxyPing
+	cmdConnect byte = 0
+	cmdData    byte = 1
+	cmdClose   byte = 2
+	cmdPing    byte = 3
 
+	frameHdrLen       = 7 // [cmd:1][connID:4LE][len:2LE]
 	heartbeatInterval = 10 * time.Second
-)
-
-type StatusCode byte
-
-func (s StatusCode) Error() string {
-	switch s {
-	case StatusOK:
-		return "OK"
-	case StatusError:
-		return "Error"
-	case StatusRejected:
-		return "Rejected"
-	default:
-		return fmt.Sprintf("Unknown(%0x)", byte(s))
-	}
-}
-
-const (
-	StatusOK StatusCode = iota
-	StatusError
-	StatusRejected
+	reconnectDelay    = 3 * time.Second
 )
 
 var (
-	ErrNotConnected    = errors.New("proxy not connected")
-	ErrConnectRejected = errors.New("connection rejected")
+	ErrNotConnected = errors.New("proxy relay not connected")
+	ErrConnRejected = errors.New("connection rejected by proxy")
 )
 
-type ProxyServer struct {
-	client    *Client
-	proxyHost string
-	proxyPort uint16
-	dev       *device.Device
-	mu        sync.Mutex
-	reconnect chan struct{}
-	ctx       context.Context
-	done      context.CancelFunc
-}
+// ── ProxyConn ────────────────────────────────────────────────────────────────
 
-type Client struct {
-	mu         sync.Mutex
-	conn       *device.TCPConn
-	ctx        context.Context
-	cancel     context.CancelCauseFunc
-	conns      map[uint32]*ProxyConn
-	nextConnID uint32
-	wCh        chan struct{}
-}
-
+// ProxyConn is one virtual connection multiplexed over the relay.
+// Implements io.ReadWriteCloser.
 type ProxyConn struct {
-	id       uint32
-	c        *Client
-	recvCh   chan []byte
-	ctx      context.Context
-	done     context.CancelFunc
-	last     []byte
-	connCtx  context.Context
-	connDone context.CancelCauseFunc
+	id         uint32
+	client     *Client
+	recvCh     chan []byte
+	last       []byte // unconsumed tail of last received chunk
+	ctx        context.Context
+	done       context.CancelFunc
+	closeOnce  sync.Once
+	connResult chan error // receives connect ack; buffered 1
+}
+
+// shutdown cancels the connection context and closes recvCh so Read returns EOF.
+// Safe to call multiple times from multiple goroutines.
+func (pc *ProxyConn) shutdown() {
+	pc.closeOnce.Do(func() {
+		pc.done()
+		close(pc.recvCh)
+	})
 }
 
 func (pc *ProxyConn) Read(p []byte) (int, error) {
-	if len(pc.last) == 0 {
+	for len(pc.last) == 0 {
 		select {
-		case pc.last = <-pc.recvCh:
+		case data, ok := <-pc.recvCh:
+			if !ok {
+				return 0, io.EOF
+			}
+			pc.last = data
 		case <-pc.ctx.Done():
 			return 0, io.EOF
 		}
 	}
-	var n int
-	if len(pc.last) > len(p) {
-		n = len(p)
-	} else {
-		n = len(pc.last)
-	}
-	copy(p, pc.last)
+	n := copy(p, pc.last)
 	pc.last = pc.last[n:]
 	return n, nil
 }
 
-func (pc *ProxyConn) Write(p []byte) (n int, err error) {
-	for len(p) > 0 {
-		if pc.ctx.Err() != nil {
-			return n, context.Cause(pc.ctx)
-		}
-		chunkSize := len(p)
-		if chunkSize > math.MaxUint16 {
-			chunkSize = math.MaxUint16
-		}
-		pc.c.writeCmd(CmdProxyData, pc.id, p[:chunkSize])
-		n += chunkSize
-		p = p[chunkSize:]
+func (pc *ProxyConn) Write(p []byte) (int, error) {
+	if pc.ctx.Err() != nil {
+		return 0, io.ErrClosedPipe
 	}
-	return
+	pc.client.writeFrame(cmdData, pc.id, p)
+	return len(p), nil
 }
 
 func (pc *ProxyConn) Close() error {
-	pc.c.closeConn(pc.id)
+	pc.client.removeConn(pc.id)
+	pc.shutdown()
+	pc.client.writeFrame(cmdClose, pc.id, nil)
 	return nil
 }
 
-func (c *Client) ConnectRemote(host string, port uint16) (*ProxyConn, error) {
-	hostBytes := []byte(host)
-	if len(hostBytes) > 253 {
-		return nil, errors.New("hostname too long")
+// deliver pushes incoming data into the recv channel.
+// Uses recover to guard against the rare race where shutdown closes recvCh
+// just as deliver is about to send.
+func (pc *ProxyConn) deliver(data []byte) {
+	defer func() { recover() }() //nolint:errcheck
+	if pc.ctx.Err() != nil {
+		return // already closed
 	}
-
-	connID := c.allocConnID()
-	pc := &ProxyConn{
-		id:     connID,
-		c:      c,
-		recvCh: make(chan []byte, 64),
-	}
-	pc.ctx, pc.done = context.WithCancel(c.ctx)
-	pc.connCtx, pc.connDone = context.WithCancelCause(context.Background())
-	c.mu.Lock()
-	c.conns[connID] = pc
-	c.mu.Unlock()
-
-	payload := make([]byte, 1+len(hostBytes)+2)
-	payload[0] = byte(len(hostBytes))
-	copy(payload[1:], hostBytes)
-	binary.LittleEndian.PutUint16(payload[1+len(hostBytes):], port)
-	c.writeCmd(CmdProxyConnect, connID, payload)
+	cp := append([]byte(nil), data...)
 	select {
-	case <-pc.connCtx.Done():
-		err := context.Cause(pc.connCtx)
-		var code StatusCode
-		if !errors.Is(code, StatusOK) {
-			c.mu.Lock()
-			delete(c.conns, connID)
-			c.mu.Unlock()
-			return nil, err
-		}
-	case <-c.ctx.Done():
-		return nil, context.Cause(c.ctx)
+	case pc.recvCh <- cp:
+	default:
+		slog.Warn("proxy: recv buffer full, dropping data", "connID", pc.id)
 	}
-	slog.Debug("proxy: connected to remote", "connID", connID, "host", host, "port", port)
-	return pc, nil
 }
 
-func (c *Client) allocConnID() uint32 {
-	c.mu.Lock()
-	id := c.nextConnID
-	c.nextConnID++
-	c.mu.Unlock()
-	return id
+// ── Client ───────────────────────────────────────────────────────────────────
+
+// Client runs on top of a single relay TCPConn and multiplexes virtual
+// connections using the proxy wire protocol.
+type Client struct {
+	conn   *device.TCPConn
+	mu     sync.Mutex
+	conns  map[uint32]*ProxyConn
+	nextID uint32
+	wLock  chan struct{} // serialises writes
+	ctx    context.Context
+	cancel context.CancelCauseFunc
 }
 
-func (c *Client) sendCommand(cmd byte, connID byte, payload []byte) ([]byte, error) {
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-
-	if conn == nil {
-		return nil, ErrNotConnected
+func newClient(conn *device.TCPConn, ctx context.Context, cancel context.CancelCauseFunc) *Client {
+	return &Client{
+		conn:   conn,
+		conns:  make(map[uint32]*ProxyConn),
+		wLock:  make(chan struct{}, 1),
+		ctx:    ctx,
+		cancel: cancel,
 	}
-
-	frame := make([]byte, 4+len(payload))
-	frame[0] = cmd
-	frame[1] = connID
-	frame[2] = byte(len(payload) >> 8)
-	frame[3] = byte(len(payload))
-	copy(frame[4:], payload)
-
-	// 发送命令
-	err := conn.Write(frame)
-	if err != nil {
-		return nil, err
-	}
-
-	// 读取响应
-	resp, err := conn.Read()
-	if err != nil {
-		return nil, err
-	}
-
-	return resp, nil
 }
 
-func (c *Client) writeCmd(cmd byte, connID uint32, data []byte) {
+func (c *Client) writeFrame(cmd byte, connID uint32, data []byte) {
 	select {
-	case c.wCh <- struct{}{}:
-		defer func() { <-c.wCh }()
+	case c.wLock <- struct{}{}:
+		defer func() { <-c.wLock }()
 	case <-c.ctx.Done():
 		return
 	}
-	frame := make([]byte, 7+len(data))
+	frame := make([]byte, frameHdrLen+len(data))
 	frame[0] = cmd
-	binary.LittleEndian.PutUint32(frame[1:5], connID)
-	binary.LittleEndian.PutUint16(frame[5:7], uint16(len(data)))
-	copy(frame[7:], data)
-	err := c.conn.Write(frame)
-	if err != nil {
-		slog.Warn("proxy send data failed", "connID", connID, "err", err)
+	binary.LittleEndian.PutUint32(frame[1:], connID)
+	binary.LittleEndian.PutUint16(frame[5:], uint16(len(data)))
+	copy(frame[frameHdrLen:], data)
+	if err := c.conn.Write(frame); err != nil {
 		c.cancel(err)
-	} else {
-		slog.Debug("proxy sent data", "connID", connID, "len", len(data))
 	}
 }
 
-func (c *Client) closeConn(connID uint32) {
+func (c *Client) removeConn(id uint32) {
 	c.mu.Lock()
-	pc := c.conns[connID]
-	delete(c.conns, connID)
+	delete(c.conns, id)
 	c.mu.Unlock()
-	if pc != nil {
-		pc.done()
-		c.writeCmd(CmdProxyClose, connID, nil)
-	}
 }
 
-func (c *Client) heartbeat() {
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-			c.writeCmd(CmdProxyPing, 0, nil)
+func (c *Client) getConn(id uint32) *ProxyConn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conns[id]
+}
+
+// ConnectRemote opens a virtual connection to host:port via the proxy server.
+func (c *Client) ConnectRemote(host string, port uint16) (*ProxyConn, error) {
+	hostB := []byte(host)
+	payload := make([]byte, 1+len(hostB)+2)
+	payload[0] = byte(len(hostB))
+	copy(payload[1:], hostB)
+	binary.LittleEndian.PutUint16(payload[1+len(hostB):], port)
+
+	// Allocate connection slot.
+	c.mu.Lock()
+	id := c.nextID
+	c.nextID++
+	connCtx, connDone := context.WithCancel(c.ctx)
+	pc := &ProxyConn{
+		id:         id,
+		client:     c,
+		recvCh:     make(chan []byte, 64),
+		ctx:        connCtx,
+		done:       connDone,
+		connResult: make(chan error, 1),
+	}
+	c.conns[id] = pc
+	c.mu.Unlock()
+
+	c.writeFrame(cmdConnect, id, payload)
+
+	// Wait for connect ack from proxy server.
+	select {
+	case err := <-pc.connResult:
+		if err != nil {
+			c.removeConn(id)
+			pc.shutdown()
+			return nil, err
 		}
+		return pc, nil
+	case <-c.ctx.Done():
+		c.removeConn(id)
+		pc.shutdown()
+		return nil, context.Cause(c.ctx)
 	}
 }
 
+// shutdownAll closes every active ProxyConn.  Called when the relay dies.
+func (c *Client) shutdownAll() {
+	c.mu.Lock()
+	conns := make([]*ProxyConn, 0, len(c.conns))
+	for _, pc := range c.conns {
+		conns = append(conns, pc)
+	}
+	c.conns = make(map[uint32]*ProxyConn)
+	c.mu.Unlock()
+	for _, pc := range conns {
+		pc.shutdown()
+	}
+}
+
+// relayReader adapts device.TCPConn (chunk-based reads) to io.Reader so we
+// can use io.ReadFull for clean frame reassembly.
+type relayReader struct {
+	conn *device.TCPConn
+	buf  []byte
+}
+
+func (r *relayReader) Read(p []byte) (int, error) {
+	for len(r.buf) == 0 {
+		data, err := r.conn.Read()
+		if err != nil {
+			return 0, err
+		}
+		r.buf = data
+	}
+	n := copy(p, r.buf)
+	r.buf = r.buf[n:]
+	return n, nil
+}
+
+// readLoop reads proxy frames and dispatches them.  Blocks until the relay
+// connection is lost, then calls shutdownAll.
 func (c *Client) readLoop() {
-	defer c.cancel(ErrNotConnected)
-	header := make([]byte, 0, 7)
-	var last []byte
-	var payLoad []byte
-	var err error
+	defer func() {
+		c.cancel(ErrNotConnected)
+		c.shutdownAll()
+	}()
+
+	r := &relayReader{conn: c.conn}
+	hdr := make([]byte, frameHdrLen)
+
 	for c.ctx.Err() == nil {
-		if len(last) == 0 {
-			last, err = c.conn.Read()
-			if err != nil {
-				slog.Warn("proxy read error", "err", err)
+		if _, err := io.ReadFull(r, hdr); err != nil {
+			if c.ctx.Err() == nil {
+				slog.Warn("proxy: relay read error", "err", err)
 				c.cancel(err)
+			}
+			return
+		}
+
+		cmd := hdr[0]
+		connID := binary.LittleEndian.Uint32(hdr[1:5])
+		payLen := int(binary.LittleEndian.Uint16(hdr[5:7]))
+
+		var payload []byte
+		if payLen > 0 {
+			payload = make([]byte, payLen)
+			if _, err := io.ReadFull(r, payload); err != nil {
+				if c.ctx.Err() == nil {
+					c.cancel(err)
+				}
 				return
 			}
 		}
-		headerRemain := cap(header) - len(header)
-		if headerRemain > 0 {
-			if headerRemain > len(last) {
-				header = append(header, last...)
-				last = nil
-			} else {
-				header = append(header, last[:headerRemain]...)
-				last = last[headerRemain:]
-				payLoad = make([]byte, 0, binary.LittleEndian.Uint16(header[5:]))
+
+		c.dispatch(cmd, connID, payload)
+	}
+}
+
+func (c *Client) dispatch(cmd byte, connID uint32, payload []byte) {
+	switch cmd {
+	case cmdConnect:
+		pc := c.getConn(connID)
+		if pc == nil {
+			return
+		}
+		var err error
+		if len(payload) != 1 {
+			err = errors.New("proxy: malformed connect ack")
+		} else if payload[0] != 0 {
+			err = fmt.Errorf("%w (status=%d)", ErrConnRejected, payload[0])
+		}
+		select {
+		case pc.connResult <- err:
+		default:
+		}
+
+	case cmdData:
+		if pc := c.getConn(connID); pc != nil {
+			pc.deliver(payload)
+		}
+
+	case cmdClose:
+		if pc := c.getConn(connID); pc != nil {
+			c.removeConn(connID)
+			pc.shutdown()
+		}
+	case cmdPing:
+	default:
+		slog.Warn("proxy: unknown frame command", "cmd", cmd)
+	}
+}
+
+// ── ProxyServer ──────────────────────────────────────────────────────────────
+
+// ProxyServer manages the relay lifecycle and exposes Connect for callers.
+// The relay to proxyHost:proxyPort is established eagerly and re-established
+// automatically whenever it drops.
+type ProxyServer struct {
+	proxyHost string
+	proxyPort uint16
+	dev       *device.Device
+	mu        sync.RWMutex
+	client    *Client
+	ctx       context.Context
+	done      context.CancelFunc
+}
+
+// New creates and starts a ProxyServer.  Callers should use Connect to open
+// virtual connections; Close shuts everything down.
+func New(proxyHost string, proxyPort uint16, dev *device.Device) *ProxyServer {
+	ps := &ProxyServer{
+		proxyHost: proxyHost,
+		proxyPort: proxyPort,
+		dev:       dev,
+	}
+	ps.ctx, ps.done = context.WithCancel(context.Background())
+	go ps.manage()
+	return ps
+}
+
+// manage is the relay lifecycle goroutine.
+func (ps *ProxyServer) manage() {
+	for ps.ctx.Err() == nil {
+		conn, err := ps.dev.TCPConnect(ps.proxyHost, ps.proxyPort)
+		if err != nil {
+			slog.Warn("proxy: relay connect failed", "host", ps.proxyHost,
+				"port", ps.proxyPort, "err", err)
+			select {
+			case <-time.After(reconnectDelay):
+			case <-ps.ctx.Done():
+				return
 			}
 			continue
 		}
-		payLoadRemain := cap(payLoad) - len(payLoad)
-		if payLoadRemain >= 0 {
-			if payLoadRemain > len(last) {
-				payLoad = append(payLoad, last...)
-				last = nil
-			} else {
-				payLoad = append(payLoad, last[:payLoadRemain]...)
-				c.handleData(header[0], binary.LittleEndian.Uint32(header[1:]), payLoad)
-				header = header[:0]
-				payLoad = nil
-				last = last[payLoadRemain:]
-			}
-		}
-	}
-}
 
-func (c *Client) handleData(cmd byte, connID uint32, data []byte) {
-	c.mu.Lock()
-	pc := c.conns[connID]
-	c.mu.Unlock()
-	switch cmd {
-	case CmdProxyConnect:
-		if pc != nil {
-			if len(data) == 1 {
-				pc.connDone(StatusCode(data[0]))
-			} else {
-				pc.connDone(errors.New("proxy connect: short response"))
-			}
-		}
-	case CmdProxyData:
-		if pc != nil {
-			select {
-			case pc.recvCh <- data:
-			case <-pc.ctx.Done():
-			default:
-				slog.Warn("proxy recv buffer full", "connID", connID)
-			}
-		}
-	case CmdProxyClose:
-		if pc != nil {
-			c.mu.Lock()
-			delete(c.conns, connID)
-			c.mu.Unlock()
-			pc.done()
-		}
-	case CmdProxyPing:
-		// heartbeat response, do nothing
-	default:
-		slog.Warn("unknown command", "cmd", cmd)
-	}
-}
+		clientCtx, clientCancel := context.WithCancelCause(ps.ctx)
+		client := newClient(conn, clientCtx, clientCancel)
 
-func (c *ProxyServer) handleReconnect() {
-	for {
-		select {
-		case <-c.reconnect:
-		case <-c.ctx.Done():
+		ps.mu.Lock()
+		ps.client = client
+		ps.mu.Unlock()
+
+		slog.Info("proxy: relay up", "host", ps.proxyHost, "port", ps.proxyPort)
+
+		// Heartbeat goroutine — keeps the relay alive.
+		go func() {
+			ticker := time.NewTicker(heartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					client.writeFrame(cmdPing, 0, nil)
+				case <-clientCtx.Done():
+					return
+				}
+			}
+		}()
+
+		// readLoop blocks until the relay dies.
+		client.readLoop()
+
+		ps.mu.Lock()
+		if ps.client == client {
+			ps.client = nil
+		}
+		ps.mu.Unlock()
+
+		if ps.ctx.Err() != nil {
 			return
 		}
-		connect, err := c.dev.TCPConnect(c.proxyHost, c.proxyPort)
-		if err != nil {
-			slog.Warn("proxy reconnect failed", "err", err)
-		} else {
-			newClient := &Client{
-				conn:  connect,
-				conns: make(map[uint32]*ProxyConn),
-				wCh:   make(chan struct{}, 1),
-			}
-			newClient.ctx, newClient.cancel = context.WithCancelCause(c.ctx)
-			go newClient.readLoop()
-			go newClient.heartbeat()
-			c.mu.Lock()
-			c.client = newClient
-			c.mu.Unlock()
-		}
-	}
-}
-
-func (c *ProxyServer) getClient() (*Client, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.client == nil || c.client.ctx.Err() != nil {
+		slog.Info("proxy: relay lost, reconnecting", "after", reconnectDelay)
 		select {
-		case c.reconnect <- struct{}{}:
-		default:
+		case <-time.After(reconnectDelay):
+		case <-ps.ctx.Done():
+			return
 		}
-		return nil, ErrNotConnected
 	}
-	return c.client, nil
 }
 
-func (c *ProxyServer) Close() {
-	c.done()
-}
-
-func (c *ProxyServer) Connect(host string, port uint16) (io.ReadWriteCloser, error) {
-	client, err := c.getClient()
-	if err != nil {
-		return nil, err
+// Connect opens a virtual connection to host:port via the proxy server.
+// Returns an io.ReadWriteCloser ready for bidirectional data relay.
+func (ps *ProxyServer) Connect(host string, port uint16) (io.ReadWriteCloser, error) {
+	ps.mu.RLock()
+	client := ps.client
+	ps.mu.RUnlock()
+	if client == nil || client.ctx.Err() != nil {
+		return nil, ErrNotConnected
 	}
 	return client.ConnectRemote(host, port)
 }
 
-func New(host string, prot uint16, dev *device.Device) *ProxyServer {
-	server := &ProxyServer{
-		proxyHost: host,
-		dev:       dev,
-		proxyPort: prot,
-		reconnect: make(chan struct{}, 1),
-	}
-	server.ctx, server.done = context.WithCancel(context.Background())
-	go server.handleReconnect()
-	return server
+// Close shuts down the proxy server and its relay connection.
+func (ps *ProxyServer) Close() {
+	ps.done()
 }

@@ -1,6 +1,6 @@
 // Package device manages the serial connection to the ESP32 and provides
 // a request/response API matched by sequence number, plus unsolicited
-// push-frame dispatch for TCP tunnelling.
+// push-frame dispatch for the single proxy relay connection.
 package device
 
 import (
@@ -23,53 +23,32 @@ const (
 	readBufSize    = 512
 	defaultTimeout = 15 * time.Second
 	tcpConnTimeout = 15 * time.Second
-	tcpMaxConns    = 16
-	// initialCredit must match TCP_SNDBUF on the ESP32 side (tcp_mgr.c).
-	// Seeds the credit window so ctrl can immediately fill the socket send
-	// buffer without waiting for the first CMD_TCP_SEND_CREDIT push.
-	initialCredit  = 5760
 )
 
 var (
 	ErrNotConnected = errors.New("device not connected")
 	ErrTimeout      = errors.New("response timeout")
-	ErrNoSlots      = errors.New("no free TCP connection slots on device")
 )
 
-// TCPConn is a TCP connection tunnelled via the ESP32's WiFi.
-// Use Read to receive data pushed by the device and Write to send data.
+// TCPConn is the single relay connection tunnelled through the ESP32 to the
+// proxy server.  Write sends raw bytes via CMD_PROXY_SEND; Read returns raw
+// bytes delivered by CMD_PROXY_DATA_PUSH push frames.
 type TCPConn struct {
-	id     byte
-	dev    *Device
-	recvCh chan []byte // closed via shutdownOnce
-	// shutdownOnce closes recvCh and wakes blocked writers; used by
-	// both the explicit Close() path and the device-push path.
-	shutdownOnce sync.Once
-	// cmdCloseOnce guards the single CMD_TCP_CLOSE transmission.
-	cmdCloseOnce sync.Once
-
-	// Credit flow control (T11)
-	creditMu   sync.Mutex
-	creditCond *sync.Cond
-	credit     int
-	closed     bool
+	dev       *Device
+	recvCh    chan []byte
+	closeOnce sync.Once
 }
 
-// shutdown tears down the local side of the connection: closes recvCh
-// so Read returns io.EOF, and wakes any Write blocked on credit.
-// Safe to call multiple times.
+// shutdown closes recvCh so any blocked Read returns io.EOF.
+// Idempotent; safe to call from multiple goroutines.
 func (c *TCPConn) shutdown() {
-	c.shutdownOnce.Do(func() {
-		c.creditMu.Lock()
-		c.closed = true
-		c.creditCond.Broadcast()
-		c.creditMu.Unlock()
+	c.closeOnce.Do(func() {
 		close(c.recvCh)
 	})
 }
 
-// Read blocks until the device pushes data for this connection,
-// or returns io.EOF when the connection is closed.
+// Read blocks until the proxy server sends data, or returns io.EOF when
+// the relay connection is closed.
 func (c *TCPConn) Read() ([]byte, error) {
 	data, ok := <-c.recvCh
 	if !ok {
@@ -78,33 +57,16 @@ func (c *TCPConn) Read() ([]byte, error) {
 	return data, nil
 }
 
-// Write sends data through the ESP32 to the remote TCP peer.
-// Large payloads are automatically split into protocol-sized chunks.
-// Each chunk waits for sufficient send credit before transmission.
+// Write sends raw bytes to the proxy server through the ESP32 relay.
+// Large payloads are split into protocol-sized chunks automatically.
 func (c *TCPConn) Write(data []byte) error {
-	const maxChunk = proto.MaxPayload - 1 // 1 byte reserved for conn_id
+	const maxChunk = proto.MaxPayload
 	for len(data) > 0 {
 		n := len(data)
 		if n > maxChunk {
 			n = maxChunk
 		}
-
-		// Wait until we have credit for this chunk (T11).
-		c.creditMu.Lock()
-		for c.credit < n && !c.closed {
-			c.creditCond.Wait()
-		}
-		if c.closed {
-			c.creditMu.Unlock()
-			return errors.New("connection closed")
-		}
-		c.credit -= n
-		c.creditMu.Unlock()
-
-		payload := make([]byte, 1+n)
-		payload[0] = c.id
-		copy(payload[1:], data[:n])
-		if err := c.dev.writeFrameNoReply(proto.CmdTCPSend, payload); err != nil {
+		if err := c.dev.writeFrameNoReply(proto.CmdProxySend, data[:n]); err != nil {
 			return err
 		}
 		data = data[n:]
@@ -112,20 +74,14 @@ func (c *TCPConn) Write(data []byte) error {
 	return nil
 }
 
-// Close tears down the TCP connection on the device side.
+// Close tears down the relay connection on both sides.
 // Idempotent; safe to call from multiple goroutines.
 func (c *TCPConn) Close() error {
-	// Unblock any blocked Read/Write immediately.
 	c.shutdown()
-	c.dev.unregisterTCPConn(c.id)
-
-	// Send CMD_TCP_CLOSE exactly once.
-	var err error
-	c.cmdCloseOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, err = c.dev.Send(ctx, proto.CmdTCPClose, []byte{c.id})
-	})
+	c.dev.clearRelayConn(c)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.dev.Send(ctx, proto.CmdProxyDisconnect, nil)
 	return err
 }
 
@@ -143,13 +99,9 @@ type Device struct {
 	pendingMu sync.Mutex
 	pending   map[byte]chan proto.Frame
 
-	// TCP push dispatch
-	tcpMu    sync.Mutex
-	tcpConns map[byte]*TCPConn
-
-	// Pending async TCP connect channels (T9)
-	connectMu      sync.Mutex
-	pendingConnect map[byte]chan error
+	// Single relay connection to the proxy server.
+	relayMu   sync.Mutex
+	relayConn *TCPConn
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -160,13 +112,11 @@ type Device struct {
 func New(portName string, baudRate int) *Device {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Device{
-		portName:       portName,
-		baudRate:       baudRate,
-		pending:        make(map[byte]chan proto.Frame),
-		tcpConns:       make(map[byte]*TCPConn),
-		pendingConnect: make(map[byte]chan error),
-		ctx:            ctx,
-		cancel:         cancel,
+		portName: portName,
+		baudRate: baudRate,
+		pending:  make(map[byte]chan proto.Frame),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
@@ -215,21 +165,13 @@ func (d *Device) Close() {
 	}
 	d.pendingMu.Unlock()
 
-	// Unblock any goroutine waiting for a TCP connect result.
-	d.connectMu.Lock()
-	for id, ch := range d.pendingConnect {
-		ch <- ErrNotConnected
-		delete(d.pendingConnect, id)
+	// Wake any blocked relay Read.
+	d.relayMu.Lock()
+	if d.relayConn != nil {
+		d.relayConn.shutdown()
+		d.relayConn = nil
 	}
-	d.connectMu.Unlock()
-
-	// Close all open TCP connections and wake blocked writers.
-	d.tcpMu.Lock()
-	for id, conn := range d.tcpConns {
-		conn.shutdown()
-		delete(d.tcpConns, id)
-	}
-	d.tcpMu.Unlock()
+	d.relayMu.Unlock()
 }
 
 // IsConnected reports whether the serial port is open.
@@ -293,7 +235,7 @@ func (d *Device) Send(ctx context.Context, cmd proto.Cmd, payload []byte) (proto
 }
 
 // writeFrameNoReply sends a frame without waiting for a response (seq=0).
-// Used for fire-and-forget commands like CmdTCPSend.
+// Used for fire-and-forget commands like CmdProxySend.
 func (d *Device) writeFrameNoReply(cmd proto.Cmd, payload []byte) error {
 	d.mu.Lock()
 	port := d.port
@@ -308,14 +250,27 @@ func (d *Device) writeFrameNoReply(cmd proto.Cmd, payload []byte) error {
 	return err
 }
 
-// TCPConnect opens a TCP connection via the ESP32 and returns a TCPConn.
-// The connection attempt happens asynchronously on the device; this function
-// waits for CMD_TCP_CONNECT_DONE before returning (T9).
+// clearRelayConn removes conn from the relay slot if it is still current.
+func (d *Device) clearRelayConn(conn *TCPConn) {
+	d.relayMu.Lock()
+	if d.relayConn == conn {
+		d.relayConn = nil
+	}
+	d.relayMu.Unlock()
+}
+
+// TCPConnect establishes the single relay connection to the proxy server.
+//
+// This sends CMD_PROXY_CONNECT to the ESP32, which synchronously connects
+// to host:port and returns OK or ERROR.  If the ESP32 reports the relay is
+// already open (StatusBusy) the stale connection is torn down first and the
+// connect is retried once.
 func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 	hostBytes := []byte(host)
 	if len(hostBytes) > 253 {
 		return nil, errors.New("hostname too long")
 	}
+
 	payload := make([]byte, 1+len(hostBytes)+2)
 	payload[0] = byte(len(hostBytes))
 	copy(payload[1:], hostBytes)
@@ -325,140 +280,67 @@ func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), tcpConnTimeout)
 	defer cancel()
 
-	// Step 1: Send CMD_TCP_CONNECT — device allocates a slot and responds
-	// with the conn_id immediately (async connect queued on device).
-	f, err := d.Send(ctx, proto.CmdTCPConnect, payload)
+	f, err := d.Send(ctx, proto.CmdProxyConnect, payload)
 	if err != nil {
-		return nil, fmt.Errorf("tcp connect %s:%d: %w", host, port, err)
+		return nil, fmt.Errorf("proxy connect %s:%d: %w", host, port, err)
 	}
-	if f.Status != proto.StatusOK {
-		return nil, fmt.Errorf("tcp connect %s:%d: device status %s", host, port, f.Status)
-	}
-	if len(f.Payload) < 1 {
-		return nil, errors.New("tcp connect: short response")
-	}
-	connID := f.Payload[0]
 
-	// Step 2: Register a channel to receive the async connect result.
-	doneCh := make(chan error, 1)
-	d.connectMu.Lock()
-	d.pendingConnect[connID] = doneCh
-	d.connectMu.Unlock()
-	defer func() {
-		d.connectMu.Lock()
-		delete(d.pendingConnect, connID)
-		d.connectMu.Unlock()
-	}()
+	// If the relay is stale (device still has the previous connection open),
+	// force-disconnect on the device side and retry once.
+	if f.Status == proto.StatusBusy {
+		slog.Info("proxy: stale relay on device — disconnecting before retry")
+		d.Send(ctx, proto.CmdProxyDisconnect, nil) //nolint:errcheck
 
-	// Step 3: Wait for CMD_TCP_CONNECT_DONE push.
-	select {
-	case connectErr := <-doneCh:
-		if connectErr != nil {
-			return nil, fmt.Errorf("tcp connect %s:%d: %w", host, port, connectErr)
+		f, err = d.Send(ctx, proto.CmdProxyConnect, payload)
+		if err != nil {
+			return nil, fmt.Errorf("proxy connect %s:%d (retry): %w", host, port, err)
 		}
-	case <-ctx.Done():
-		// Timed out — tell ESP32 to free the slot so it isn't occupied for 60 s.
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer closeCancel()
-		d.Send(closeCtx, proto.CmdTCPClose, []byte{connID}) //nolint:errcheck
-		return nil, fmt.Errorf("tcp connect %s:%d: timeout waiting for connect done", host, port)
-	case <-d.ctx.Done():
-		return nil, ErrNotConnected
 	}
 
-	// Step 4: Connection succeeded — create TCPConn with seed credit (T11).
+	if f.Status != proto.StatusOK {
+		return nil, fmt.Errorf("proxy connect %s:%d: device status %s", host, port, f.Status)
+	}
+
 	conn := &TCPConn{
-		id:     connID,
 		dev:    d,
 		recvCh: make(chan []byte, 64),
-		credit: initialCredit,
 	}
-	conn.creditCond = sync.NewCond(&conn.creditMu)
 
-	d.tcpMu.Lock()
-	d.tcpConns[connID] = conn
-	d.tcpMu.Unlock()
-
-	// Step 5: Send ACK so ESP32's rx task starts delivering data.
-	if err := d.writeFrameNoReply(proto.CmdTcpConnectAck, []byte{connID}); err != nil {
-		d.unregisterTCPConn(connID)
-		return nil, fmt.Errorf("ack tcp connect error: %w", err)
+	d.relayMu.Lock()
+	// Evict any previous relay conn that was not properly cleaned up.
+	if d.relayConn != nil {
+		d.relayConn.shutdown()
 	}
-	slog.Debug("tcp connected", "id", connID, "host", host, "port", port)
+	d.relayConn = conn
+	d.relayMu.Unlock()
+
+	slog.Debug("proxy relay connected", "host", host, "port", port)
 	return conn, nil
-}
-
-func (d *Device) unregisterTCPConn(id byte) {
-	d.tcpMu.Lock()
-	delete(d.tcpConns, id)
-	d.tcpMu.Unlock()
 }
 
 // dispatchPush handles unsolicited push frames from the device.
 func (d *Device) dispatchPush(f proto.Frame) {
 	switch f.Cmd {
-	case proto.CmdTCPDataPush:
-		if len(f.Payload) < 1 {
-			return
-		}
-		connID := f.Payload[0]
-		data := f.Payload[1:]
-		d.tcpMu.Lock()
-		conn := d.tcpConns[connID]
-		d.tcpMu.Unlock()
-		if conn != nil && len(data) > 0 {
+	case proto.CmdProxyDataPush:
+		d.relayMu.Lock()
+		conn := d.relayConn
+		d.relayMu.Unlock()
+		if conn != nil && len(f.Payload) > 0 {
 			select {
-			case conn.recvCh <- append([]byte(nil), data...):
+			case conn.recvCh <- append([]byte(nil), f.Payload...):
 			default:
-				slog.Warn("tcp recv buffer full, dropping data", "conn", connID)
+				slog.Warn("proxy recv buffer full, dropping data")
 			}
 		}
 
-	case proto.CmdTCPClosedPush:
-		if len(f.Payload) < 1 {
-			return
-		}
-		connID := f.Payload[0]
-		d.tcpMu.Lock()
-		conn := d.tcpConns[connID]
-		delete(d.tcpConns, connID)
-		d.tcpMu.Unlock()
+	case proto.CmdProxyClosedPush:
+		d.relayMu.Lock()
+		conn := d.relayConn
+		d.relayConn = nil
+		d.relayMu.Unlock()
 		if conn != nil {
 			conn.shutdown()
-			slog.Debug("tcp conn closed by device", "conn", connID)
-		}
-
-	case proto.CmdTCPConnectDone: // T9: async connect result
-		if len(f.Payload) < 2 {
-			return
-		}
-		connID, status := f.Payload[0], f.Payload[1]
-		d.connectMu.Lock()
-		ch := d.pendingConnect[connID]
-		delete(d.pendingConnect, connID)
-		d.connectMu.Unlock()
-		if ch != nil {
-			if status == 0 {
-				ch <- nil
-			} else {
-				ch <- fmt.Errorf("connect failed: errno %d", status)
-			}
-		}
-
-	case proto.CmdTCPSendCredit: // T11: replenish send credit
-		if len(f.Payload) < 3 {
-			return
-		}
-		connID := f.Payload[0]
-		credits := int(f.Payload[1])<<8 | int(f.Payload[2])
-		d.tcpMu.Lock()
-		conn := d.tcpConns[connID]
-		d.tcpMu.Unlock()
-		if conn != nil {
-			conn.creditMu.Lock()
-			conn.credit += credits
-			conn.creditCond.Broadcast()
-			conn.creditMu.Unlock()
+			slog.Debug("proxy relay closed by device")
 		}
 	}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/manx98/esp32-ctrl/api"
 	"github.com/manx98/esp32-ctrl/device"
+	"github.com/manx98/esp32-ctrl/proxy"
 	"github.com/manx98/esp32-ctrl/socks5"
 )
 
@@ -41,25 +42,24 @@ func main() {
 	defer dev.Close()
 
 	if *socks5Addr != "" {
-		var proxy *socks5.Server
-		if *proxyAddr != "" {
-			slog.Info("using external proxy", "addr", *proxyAddr)
-			proxyHost, proxyPortStr, err := net.SplitHostPort(*proxyAddr)
-			var proxyPort int
-			if err == nil {
-				proxyPort, err = strconv.Atoi(proxyPortStr)
-			}
-			if err != nil {
-				slog.Warn("could not split proxy address", "addr", *proxyAddr, "err", err)
-				os.Exit(1)
-			}
-			proxy = socks5.NewWithProxy(dev, proxyHost, uint16(proxyPort))
-		} else {
-			slog.Info("using ESP32 direct connection")
-			proxy = socks5.New(dev)
+		if *proxyAddr == "" {
+			slog.Error("--proxy is required when --socks5 is enabled")
+			os.Exit(1)
 		}
+		proxyHost, proxyPortStr, err := net.SplitHostPort(*proxyAddr)
+		var proxyPort int
+		if err == nil {
+			proxyPort, err = strconv.Atoi(proxyPortStr)
+		}
+		if err != nil {
+			slog.Error("invalid --proxy address", "addr", *proxyAddr, "err", err)
+			os.Exit(1)
+		}
+		ps := proxy.New(proxyHost, uint16(proxyPort), dev)
+		defer ps.Close()
+		slog.Info("proxy relay target", "addr", *proxyAddr)
 		go func() {
-			if err := proxy.ListenAndServe(*socks5Addr); err != nil {
+			if err := socks5.New(ps).ListenAndServe(*socks5Addr); err != nil {
 				slog.Error("socks5 proxy error", "err", err)
 			}
 		}()

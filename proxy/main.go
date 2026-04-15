@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,205 +21,94 @@ const (
 	CmdProxyPing
 
 	heartbeatInterval = 10 * time.Second
+
+	// relayReadBuf: read buffer for target→relay path.  Large enough to fill
+	// several TCP segments in one shot, reducing frame count.
+	relayReadBuf = 32 * 1024
+
+	// relayWriteQ: relay write queue depth.  Each entry is one serialised frame.
+	// Acts as a pressure buffer so relayData goroutines never block on relay writes.
+	relayWriteQ = 512
+
+	// targetWriteQ: per-connection queue for ctrl→target writes.
+	// Keeps the main read loop non-blocking even when a target is slow.
+	targetWriteQ = 64
 )
 
 const (
-	StatusOK byte = iota
-	StatusError
-	StatusRejected
+	StatusOK       byte = 0
+	StatusError    byte = 1
+	StatusRejected byte = 2
 )
 
-type ProxyServer struct {
-	conn       net.Conn
-	mu         sync.Mutex
-	conns      map[uint32]net.Conn
-	wLock      chan struct{}
-	nextConnID uint32
-	ctx        context.Context
-	cause      context.CancelCauseFunc
+// ── targetConn ───────────────────────────────────────────────────────────────
+
+// targetConn wraps a TCP connection to a remote host.  It owns two goroutines:
+//   - writeLoop: drains targetConn.writeQ → target TCP
+//   - readLoop:  reads from target TCP   → relay write queue
+//
+// Both goroutines exit when ctx is cancelled.
+type targetConn struct {
+	id        uint32
+	server    *ProxyServer
+	conn      net.Conn
+	writeQ    chan []byte
+	ctx       context.Context
+	done      context.CancelFunc
+	closeOnce sync.Once
 }
 
-func New(conn net.Conn) *ProxyServer {
-	server := &ProxyServer{
-		conn:  conn,
-		conns: make(map[uint32]net.Conn),
-		wLock: make(chan struct{}, 1),
+func newTargetConn(id uint32, srv *ProxyServer, conn net.Conn) *targetConn {
+	ctx, done := context.WithCancel(srv.ctx)
+	tc := &targetConn{
+		id:     id,
+		server: srv,
+		conn:   conn,
+		writeQ: make(chan []byte, targetWriteQ),
+		ctx:    ctx,
+		done:   done,
 	}
-	server.ctx, server.cause = context.WithCancelCause(context.Background())
-	return server
+	go tc.writeLoop()
+	go tc.readLoop()
+	return tc
 }
 
-func (s *ProxyServer) cleanup() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, conn := range s.conns {
-		_ = conn.Close()
-	}
-}
-
-func (s *ProxyServer) Run() {
-	slog.Info("client connected", "addr", s.conn.RemoteAddr())
-
-	heartbeat := time.NewTicker(heartbeatInterval)
-	defer s.cleanup()
-	defer heartbeat.Stop()
-	go func() {
-		for {
-			select {
-			case <-heartbeat.C:
-				s.sendPing()
-			case <-s.ctx.Done():
-			}
-		}
-	}()
-
-	buf := make([]byte, 7)
-	for s.ctx.Err() == nil {
-		select {
-		case <-heartbeat.C:
-			s.sendPing()
-		default:
-		}
-		_, err := io.ReadFull(s.conn, buf)
-		if err != nil {
-			slog.Info("client read error", "err", err)
-			s.cause(err)
-			return
-		}
-		connId := binary.LittleEndian.Uint32(buf[1:5])
-		payloadLen := binary.LittleEndian.Uint16(buf[5:7])
-		payload := make([]byte, payloadLen)
-		_, err = io.ReadFull(s.conn, payload)
-		if err != nil {
-			slog.Info("client read error", "err", err)
-			s.cause(err)
-			return
-		}
-		s.handleClientData(buf[0], connId, payload)
-	}
-}
-
-func (s *ProxyServer) writeCmd(cmd byte, connID uint32, data []byte) {
+// enqueue adds data to the target write queue (non-blocking).
+// Drops data and logs a warning if the queue is full.
+func (tc *targetConn) enqueue(data []byte) {
+	cp := append([]byte(nil), data...)
 	select {
-	case s.wLock <- struct{}{}:
-		defer func() { <-s.wLock }()
-	case <-s.ctx.Done():
-		return
-	}
-	n := len(data)
-	frame := make([]byte, 7+n)
-	frame[0] = cmd
-	binary.LittleEndian.PutUint32(frame[1:], connID)
-	binary.LittleEndian.PutUint16(frame[5:], uint16(n))
-	copy(frame[7:], data)
-	_, err := s.conn.Write(frame)
-	if err != nil {
-		s.cause(err)
-	}
-}
-
-func (s *ProxyServer) sendPing() {
-	s.writeCmd(CmdProxyPing, 0, nil)
-}
-
-func (s *ProxyServer) handleClientData(cmd byte, connID uint32, payload []byte) {
-	switch cmd {
-	case CmdProxyConnect:
-		slog.Info("proxy: connect command", "connID", connID, "payloadLen", len(payload))
-		s.handleProxyConnect(connID, payload)
-	case CmdProxyData:
-		slog.Info("proxy: data command", "connID", connID, "dataLen", len(payload))
-		s.handleProxyData(connID, payload)
-	case CmdProxyClose:
-		slog.Info("proxy: close command", "connID", connID)
-		s.handleProxyClose(connID)
-	case CmdProxyPing:
-		// 心跳响应
-		slog.Info("proxy: ping command")
-		s.writeCmd(CmdProxyPing, 0, nil)
+	case tc.writeQ <- cp:
+	case <-tc.ctx.Done():
 	default:
-		slog.Warn("proxy: unknown cmd", "cmd", cmd)
+		slog.Warn("target write queue full, dropping data", "connID", tc.id)
 	}
 }
 
-func (s *ProxyServer) handleProxyConnect(connID uint32, payload []byte) {
-	if len(payload) < 3 {
-		s.cause(errors.New("invalid play"))
-		return
+// writeLoop drains writeQ into the target TCP connection.
+func (tc *targetConn) writeLoop() {
+	for {
+		select {
+		case data := <-tc.writeQ:
+			if _, err := tc.conn.Write(data); err != nil {
+				slog.Warn("target write error", "connID", tc.id, "err", err)
+				tc.closeNotify()
+				return
+			}
+		case <-tc.ctx.Done():
+			return
+		}
 	}
-
-	hostLen := int(payload[0])
-	if len(payload) != 1+hostLen+2 {
-		s.writeCmd(CmdProxyConnect, connID, []byte{StatusError})
-		return
-	}
-
-	host := string(payload[1 : 1+hostLen])
-	port := binary.LittleEndian.Uint16(payload[1+hostLen:])
-
-	slog.Info("proxy connect", "connID", connID, "host", host, "port", port)
-	target, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
-	if err != nil {
-		slog.Warn("dial failed", "host", host, "port", port, "err", err)
-		s.writeCmd(CmdProxyConnect, connID, []byte{StatusRejected})
-		return
-	}
-
-	s.mu.Lock()
-	s.conns[connID] = target
-	s.mu.Unlock()
-
-	s.writeCmd(CmdProxyConnect, connID, []byte{StatusOK})
-	go s.relayData(connID, target)
 }
 
-func (s *ProxyServer) handleProxyData(connID uint32, payload []byte) {
-	s.mu.Lock()
-	pc := s.conns[connID]
-	s.mu.Unlock()
-
-	if pc == nil {
-		slog.Warn("proxy: data for unknown connection", "connID", connID)
-		return
-	}
-
-	n, err := pc.Write(payload)
-	if err != nil {
-		slog.Warn("proxy: write to target failed", "connID", connID, "err", err)
-		return
-	}
-	slog.Info("proxy: wrote data to target", "connID", connID, "bytes", n)
-	return
-}
-
-func (s *ProxyServer) handleProxyClose(connID uint32) {
-	s.mu.Lock()
-	pc := s.conns[connID]
-	delete(s.conns, connID)
-	s.mu.Unlock()
-	if pc == nil {
-		slog.Warn("proxy: close for unknown connection", "connID", connID)
-		return
-	}
-	_ = pc.Close()
-}
-
-func (s *ProxyServer) relayData(connId uint32, conn net.Conn) {
-	var err error
-	defer func() {
-		s.mu.Lock()
-		delete(s.conns, connId)
-		s.mu.Unlock()
-		s.writeCmd(CmdProxyClose, connId, nil)
-		_ = conn.Close()
-	}()
-
-	buf := make([]byte, 4096)
-	var n int
-	for s.ctx.Err() == nil {
-		n, err = conn.Read(buf)
+// readLoop reads from the target and forwards data to the relay write queue.
+func (tc *targetConn) readLoop() {
+	defer tc.closeNotify()
+	buf := make([]byte, relayReadBuf)
+	for {
+		n, err := tc.conn.Read(buf)
 		if n > 0 {
-			s.writeCmd(CmdProxyData, connId, buf[:n])
+			tc.server.writeFrame(CmdProxyData, tc.id, buf[:n])
 		}
 		if err != nil {
 			break
@@ -227,25 +116,252 @@ func (s *ProxyServer) relayData(connId uint32, conn net.Conn) {
 	}
 }
 
+// closeNotify is called when the connection closes from the target side.
+// Sends CmdProxyClose to ctrl exactly once.
+func (tc *targetConn) closeNotify() {
+	tc.closeOnce.Do(func() {
+		tc.done()
+		_ = tc.conn.Close()
+		tc.server.removeConn(tc.id)
+		tc.server.writeFrame(CmdProxyClose, tc.id, nil)
+	})
+}
+
+// closeByRequest is called when ctrl explicitly sends CmdProxyClose.
+// Does NOT send CmdProxyClose back (ctrl already knows).
+func (tc *targetConn) closeByRequest() {
+	tc.closeOnce.Do(func() {
+		tc.done()
+		_ = tc.conn.Close()
+	})
+}
+
+// ── ProxyServer ───────────────────────────────────────────────────────────────
+
+// ProxyServer handles one relay connection from the ctrl side.
+//
+// Write path (target → ctrl):
+//   readLoop goroutines → writeFrame() enqueues → writeLoop() batches & flushes
+//
+// Read path (ctrl → target):
+//   Run() reads frames → dispatch() → tc.enqueue() (non-blocking)
+type ProxyServer struct {
+	conn   net.Conn
+	mu     sync.Mutex
+	conns  map[uint32]*targetConn
+	writeQ chan []byte // serialised relay-write queue
+	ctx    context.Context
+	cause  context.CancelCauseFunc
+}
+
+func New(conn net.Conn) *ProxyServer {
+	ctx, cause := context.WithCancelCause(context.Background())
+	s := &ProxyServer{
+		conn:   conn,
+		conns:  make(map[uint32]*targetConn),
+		writeQ: make(chan []byte, relayWriteQ),
+		ctx:    ctx,
+		cause:  cause,
+	}
+	go s.writeLoop()
+	return s
+}
+
+// writeLoop is the single goroutine that writes to the relay TCP connection.
+// It batches multiple queued frames into one bufio flush to reduce syscalls.
+func (s *ProxyServer) writeLoop() {
+	w := bufio.NewWriterSize(s.conn, 64*1024)
+	for {
+		// Block until at least one frame is ready.
+		select {
+		case frame, ok := <-s.writeQ:
+			if !ok {
+				return
+			}
+			w.Write(frame) //nolint:errcheck
+		case <-s.ctx.Done():
+			return
+		}
+		// Drain any additional frames that arrived while we were writing.
+		for drained := false; !drained; {
+			select {
+			case frame := <-s.writeQ:
+				w.Write(frame) //nolint:errcheck
+			default:
+				drained = true
+			}
+		}
+		if err := w.Flush(); err != nil {
+			s.cause(err)
+			return
+		}
+	}
+}
+
+// writeFrame serialises a proxy frame and enqueues it for relay transmission.
+// Never blocks on TCP; back-pressure is absorbed by writeQ depth.
+func (s *ProxyServer) writeFrame(cmd byte, connID uint32, data []byte) {
+	frame := make([]byte, 7+len(data))
+	frame[0] = cmd
+	binary.LittleEndian.PutUint32(frame[1:], connID)
+	binary.LittleEndian.PutUint16(frame[5:], uint16(len(data)))
+	copy(frame[7:], data)
+	select {
+	case s.writeQ <- frame:
+	case <-s.ctx.Done():
+	}
+}
+
+func (s *ProxyServer) addConn(tc *targetConn) {
+	s.mu.Lock()
+	s.conns[tc.id] = tc
+	s.mu.Unlock()
+}
+
+func (s *ProxyServer) removeConn(id uint32) {
+	s.mu.Lock()
+	delete(s.conns, id)
+	s.mu.Unlock()
+}
+
+func (s *ProxyServer) getConn(id uint32) *targetConn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns[id]
+}
+
+func (s *ProxyServer) cleanup() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, tc := range s.conns {
+		tc.done()
+		_ = tc.conn.Close()
+	}
+	s.conns = make(map[uint32]*targetConn)
+}
+
+// Run reads frames from the relay and dispatches them.
+// This is the only goroutine reading from s.conn; it never blocks on writes.
+func (s *ProxyServer) Run() {
+	slog.Info("relay connected", "addr", s.conn.RemoteAddr())
+	defer s.cleanup()
+
+	// Heartbeat: keep the relay TCP connection alive.
+	go func() {
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.writeFrame(CmdProxyPing, 0, nil)
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	hdr := make([]byte, 7)
+	for s.ctx.Err() == nil {
+		if _, err := io.ReadFull(s.conn, hdr); err != nil {
+			slog.Info("relay read error", "err", err)
+			s.cause(err)
+			return
+		}
+		cmd := hdr[0]
+		connID := binary.LittleEndian.Uint32(hdr[1:5])
+		payLen := int(binary.LittleEndian.Uint16(hdr[5:7]))
+
+		var payload []byte
+		if payLen > 0 {
+			payload = make([]byte, payLen)
+			if _, err := io.ReadFull(s.conn, payload); err != nil {
+				slog.Info("relay payload read error", "err", err)
+				s.cause(err)
+				return
+			}
+		}
+
+		s.dispatch(cmd, connID, payload)
+	}
+}
+
+func (s *ProxyServer) dispatch(cmd byte, connID uint32, payload []byte) {
+	switch cmd {
+	case CmdProxyConnect:
+		// Dial is blocking (DNS + TCP handshake) — run in goroutine so
+		// the main read loop is never stalled by slow connects.
+		go s.handleConnect(connID, payload)
+
+	case CmdProxyData:
+		if tc := s.getConn(connID); tc != nil {
+			tc.enqueue(payload) // non-blocking
+		}
+
+	case CmdProxyClose:
+		if tc := s.getConn(connID); tc != nil {
+			s.removeConn(connID)
+			tc.closeByRequest()
+		}
+
+	case CmdProxyPing:
+		s.writeFrame(CmdProxyPing, 0, nil)
+
+	default:
+		slog.Warn("unknown command", "cmd", cmd)
+	}
+}
+
+func (s *ProxyServer) handleConnect(connID uint32, payload []byte) {
+	if len(payload) < 3 {
+		slog.Warn("connect: payload too short", "connID", connID)
+		s.writeFrame(CmdProxyConnect, connID, []byte{StatusError})
+		return
+	}
+	hostLen := int(payload[0])
+	if len(payload) != 1+hostLen+2 {
+		slog.Warn("connect: malformed payload", "connID", connID)
+		s.writeFrame(CmdProxyConnect, connID, []byte{StatusError})
+		return
+	}
+	host := string(payload[1 : 1+hostLen])
+	port := binary.LittleEndian.Uint16(payload[1+hostLen:])
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+
+	slog.Debug("connect", "connID", connID, "addr", addr)
+	target, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		slog.Warn("dial failed", "addr", addr, "err", err)
+		s.writeFrame(CmdProxyConnect, connID, []byte{StatusRejected})
+		return
+	}
+
+	// Register BEFORE sending OK so ctrl can't send data before we're ready.
+	tc := newTargetConn(connID, s, target)
+	s.addConn(tc)
+	s.writeFrame(CmdProxyConnect, connID, []byte{StatusOK})
+	slog.Info("connected", "connID", connID, "addr", addr)
+}
+
 func main() {
 	addr := flag.String("addr", ":11080", "Proxy server listen address")
 	flag.Parse()
 
-	level := slog.LevelInfo
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
-		slog.Error("proxy: listen failed", "err", err)
+		slog.Error("listen failed", "err", err)
 		os.Exit(1)
 	}
-	slog.Info("starting proxy server", "addr", *addr)
+	slog.Info("proxy server listening", "addr", *addr)
 	for {
-		accept, err := ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			slog.Error("proxy: accept failed", "err", err)
+			slog.Error("accept failed", "err", err)
 			os.Exit(1)
 		}
-		go New(accept).Run()
+		go New(conn).Run()
 	}
 }
