@@ -23,7 +23,7 @@ func main() {
 	port := flag.String("port", "/dev/ttyACM0", "Serial port (e.g. /dev/ttyACM0 or COM3)")
 	baud := flag.Int("baud", 115200, "Baud rate")
 	addr := flag.String("addr", ":8080", "HTTP listen address")
-	socks5Addr := flag.String("socks5", ":1080", "SOCKS5 proxy listen address (empty to disable)")
+	socks5Addr := flag.String("socks5", ":1080", "Proxy listen address for SOCKS5+HTTP/HTTPS (empty to disable)")
 	proxyAddr := flag.String("proxy", "", "External proxy server address (e.g. localhost:11080)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
