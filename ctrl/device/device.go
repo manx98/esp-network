@@ -1,6 +1,16 @@
-// Package device manages the serial connection to the ESP32 and provides
+// Package device manages the USB HID connection to the ESP32 and provides
 // a request/response API matched by sequence number, plus unsolicited
 // push-frame dispatch for the single proxy relay connection.
+//
+// USB HID report format (64 bytes each direction):
+//
+//	report[0]    = number of valid proto bytes in this report (0–63)
+//	report[1..63]= proto bytes, zero-padded
+//
+// On Linux, /dev/hidrawN access requires either running as root or a udev rule:
+//
+//	SUBSYSTEM=="hidraw", ATTRS{idVendor}=="22fb", ATTRS{idProduct}=="1011", \
+//	  MODE="0666"
 package device
 
 import (
@@ -13,16 +23,23 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.bug.st/serial"
+	hid "github.com/sstallion/go-hid"
 
 	"github.com/manx98/esp32-ctrl/proto"
 )
 
 const (
-	defaultBaud    = 115200
-	readBufSize    = 512
+	// DefaultVID / DefaultPID match the user's ESP32 HID device.
+	DefaultVID uint16 = 0x22fb
+	DefaultPID uint16 = 0x1011
+
+	hidReportSize  = 64  // bytes per USB HID report
+	hidPayloadSize = 63  // usable bytes per report (byte 0 = length)
+	readTimeout    = 100 // ms for ReadWithTimeout — allows ctx cancellation polling
+
 	defaultTimeout = 15 * time.Second
 	tcpConnTimeout = 15 * time.Second
+	reconnectDelay = 3 * time.Second
 )
 
 var (
@@ -39,16 +56,10 @@ type TCPConn struct {
 	closeOnce sync.Once
 }
 
-// shutdown closes recvCh so any blocked Read returns io.EOF.
-// Idempotent; safe to call from multiple goroutines.
 func (c *TCPConn) shutdown() {
-	c.closeOnce.Do(func() {
-		close(c.recvCh)
-	})
+	c.closeOnce.Do(func() { close(c.recvCh) })
 }
 
-// Read blocks until the proxy server sends data, or returns io.EOF when
-// the relay connection is closed.
 func (c *TCPConn) Read() ([]byte, error) {
 	data, ok := <-c.recvCh
 	if !ok {
@@ -57,8 +68,6 @@ func (c *TCPConn) Read() ([]byte, error) {
 	return data, nil
 }
 
-// Write sends raw bytes to the proxy server through the ESP32 relay.
-// Large payloads are split into protocol-sized chunks automatically.
 func (c *TCPConn) Write(data []byte) error {
 	const maxChunk = proto.MaxPayload
 	for len(data) > 0 {
@@ -74,8 +83,6 @@ func (c *TCPConn) Write(data []byte) error {
 	return nil
 }
 
-// Close tears down the relay connection on both sides.
-// Idempotent; safe to call from multiple goroutines.
 func (c *TCPConn) Close() error {
 	c.shutdown()
 	c.dev.clearRelayConn(c)
@@ -85,21 +92,20 @@ func (c *TCPConn) Close() error {
 	return err
 }
 
-// Device represents a connected ESP32 over USB-CDC serial.
+// Device represents a connected ESP32 over USB HID.
 type Device struct {
-	portName string
-	baudRate int
+	vid uint16
+	pid uint16
 
 	mu      sync.Mutex
-	port    serial.Port
-	writeMu sync.Mutex // serialises all serial writes
+	port    *hid.Device
+	writeMu sync.Mutex // serialises all HID writes
 
 	seqCounter atomic.Uint32
 
 	pendingMu sync.Mutex
 	pending   map[byte]chan proto.Frame
 
-	// Single relay connection to the proxy server.
 	relayMu   sync.Mutex
 	relayConn *TCPConn
 
@@ -108,56 +114,45 @@ type Device struct {
 	wg     sync.WaitGroup
 }
 
-// New creates a Device but does not open the port yet.
-func New(portName string, baudRate int) *Device {
+// New creates a Device but does not open the HID connection yet.
+// Call Open() to start the auto-reconnect loop.
+func New(vid, pid uint16) *Device {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Device{
-		portName: portName,
-		baudRate: baudRate,
-		pending:  make(map[byte]chan proto.Frame),
-		ctx:      ctx,
-		cancel:   cancel,
+		vid:     vid,
+		pid:     pid,
+		pending: make(map[byte]chan proto.Frame),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
-// Open opens the serial port and starts the background reader.
+// Open initialises hidapi and starts the background manage goroutine that
+// keeps the HID connection alive, reconnecting automatically after failures.
+// It always returns nil; connection errors are logged and retried.
 func (d *Device) Open() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	mode := &serial.Mode{
-		BaudRate: d.baudRate,
-		DataBits: 8,
-		Parity:   serial.NoParity,
-		StopBits: serial.OneStopBit,
+	if err := hid.Init(); err != nil {
+		return fmt.Errorf("hid init: %w", err)
 	}
-	port, err := serial.Open(d.portName, mode)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", d.portName, err)
-	}
-	d.port = port
-
 	d.wg.Add(1)
-	go d.readLoop()
-
-	slog.Info("device opened", "port", d.portName, "baud", d.baudRate)
+	go d.manage()
 	return nil
 }
 
-// Close shuts down the reader and closes the port.
+// Close shuts down the manage loop and closes the HID device.
 func (d *Device) Close() {
 	d.cancel()
+	d.wg.Wait()
 
 	d.mu.Lock()
 	if d.port != nil {
-		_ = d.port.Close()
+		d.port.Close() //nolint:errcheck
 		d.port = nil
 	}
 	d.mu.Unlock()
 
-	d.wg.Wait()
+	hid.Exit() //nolint:errcheck
 
-	// Drain all pending request waiters.
 	d.pendingMu.Lock()
 	for seq, ch := range d.pending {
 		close(ch)
@@ -165,7 +160,6 @@ func (d *Device) Close() {
 	}
 	d.pendingMu.Unlock()
 
-	// Wake any blocked relay Read.
 	d.relayMu.Lock()
 	if d.relayConn != nil {
 		d.relayConn.shutdown()
@@ -174,7 +168,7 @@ func (d *Device) Close() {
 	d.relayMu.Unlock()
 }
 
-// IsConnected reports whether the serial port is open.
+// IsConnected reports whether the HID device is open.
 func (d *Device) IsConnected() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -182,7 +176,6 @@ func (d *Device) IsConnected() bool {
 }
 
 // Send transmits a request and waits for the matching response.
-// The context deadline (or defaultTimeout if none) bounds the wait.
 func (d *Device) Send(ctx context.Context, cmd proto.Cmd, payload []byte) (proto.Frame, error) {
 	d.mu.Lock()
 	port := d.port
@@ -205,10 +198,7 @@ func (d *Device) Send(ctx context.Context, cmd proto.Cmd, payload []byte) (proto
 	}()
 
 	raw := proto.BuildRequest(seq, cmd, payload)
-	d.writeMu.Lock()
-	_, err := port.Write(raw)
-	d.writeMu.Unlock()
-	if err != nil {
+	if err := d.writeRaw(raw); err != nil {
 		return proto.Frame{}, fmt.Errorf("write: %w", err)
 	}
 
@@ -235,7 +225,6 @@ func (d *Device) Send(ctx context.Context, cmd proto.Cmd, payload []byte) (proto
 }
 
 // writeFrameNoReply sends a frame without waiting for a response (seq=0).
-// Used for fire-and-forget commands like CmdProxySend.
 func (d *Device) writeFrameNoReply(cmd proto.Cmd, payload []byte) error {
 	d.mu.Lock()
 	port := d.port
@@ -243,11 +232,43 @@ func (d *Device) writeFrameNoReply(cmd proto.Cmd, payload []byte) error {
 	if port == nil {
 		return ErrNotConnected
 	}
-	raw := proto.BuildRequest(0, cmd, payload)
+	return d.writeRaw(proto.BuildRequest(0, cmd, payload))
+}
+
+// writeRaw splits raw bytes into hidPayloadSize-byte chunks and sends each as
+// a 65-byte HID OUT report: [0x00][len][data...][padding].
+// Thread-safe (protected by writeMu).
+func (d *Device) writeRaw(raw []byte) error {
+	report := make([]byte, hidReportSize+1) // hidapi: report_id(1) + data(64)
+	report[0] = 0x00                        // report ID = 0 (no report IDs)
+
 	d.writeMu.Lock()
-	_, err := port.Write(raw)
-	d.writeMu.Unlock()
-	return err
+	defer d.writeMu.Unlock()
+
+	d.mu.Lock()
+	port := d.port
+	d.mu.Unlock()
+	if port == nil {
+		return ErrNotConnected
+	}
+
+	for len(raw) > 0 {
+		n := len(raw)
+		if n > hidPayloadSize {
+			n = hidPayloadSize
+		}
+		report[1] = byte(n)
+		copy(report[2:], raw[:n])
+		// zero-pad
+		for i := 2 + n; i <= hidReportSize; i++ {
+			report[i] = 0
+		}
+		if _, err := port.Write(report); err != nil {
+			return err
+		}
+		raw = raw[n:]
+	}
+	return nil
 }
 
 // clearRelayConn removes conn from the relay slot if it is still current.
@@ -260,11 +281,6 @@ func (d *Device) clearRelayConn(conn *TCPConn) {
 }
 
 // TCPConnect establishes the single relay connection to the proxy server.
-//
-// This sends CMD_PROXY_CONNECT to the ESP32, which synchronously connects
-// to host:port and returns OK or ERROR.  If the ESP32 reports the relay is
-// already open (StatusBusy) the stale connection is torn down first and the
-// connect is retried once.
 func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 	hostBytes := []byte(host)
 	if len(hostBytes) > 253 {
@@ -285,8 +301,6 @@ func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 		return nil, fmt.Errorf("proxy connect %s:%d: %w", host, port, err)
 	}
 
-	// If the relay is stale (device still has the previous connection open),
-	// force-disconnect on the device side and retry once.
 	if f.Status == proto.StatusBusy {
 		slog.Info("proxy: stale relay on device — disconnecting before retry")
 		d.Send(ctx, proto.CmdProxyDisconnect, nil) //nolint:errcheck
@@ -307,7 +321,6 @@ func (d *Device) TCPConnect(host string, port uint16) (*TCPConn, error) {
 	}
 
 	d.relayMu.Lock()
-	// Evict any previous relay conn that was not properly cleaned up.
 	if d.relayConn != nil {
 		d.relayConn.shutdown()
 	}
@@ -345,14 +358,90 @@ func (d *Device) dispatchPush(f proto.Frame) {
 	}
 }
 
-// readLoop runs in its own goroutine, feeding serial bytes into the parser
-// and dispatching completed frames.
-func (d *Device) readLoop() {
+// drainPending closes all waiting Send() callers with ErrNotConnected.
+func (d *Device) drainPending() {
+	d.pendingMu.Lock()
+	for seq, ch := range d.pending {
+		close(ch)
+		delete(d.pending, seq)
+	}
+	d.pendingMu.Unlock()
+}
+
+// shutdownRelay tears down any active relay connection.
+func (d *Device) shutdownRelay() {
+	d.relayMu.Lock()
+	conn := d.relayConn
+	d.relayConn = nil
+	d.relayMu.Unlock()
+	if conn != nil {
+		conn.shutdown()
+	}
+}
+
+// manage is the background goroutine that opens the HID device and keeps it
+// alive.  On disconnect it drains pending requests, shuts down any relay
+// connection, and retries after reconnectDelay.
+func (d *Device) manage() {
 	defer d.wg.Done()
 
+	for {
+		// Check for shutdown before attempting open.
+		select {
+		case <-d.ctx.Done():
+			return
+		default:
+		}
+
+		dev, err := hid.OpenFirst(d.vid, d.pid)
+		if err != nil {
+			slog.Debug("HID open failed, retrying",
+				"vid", fmt.Sprintf("%04x", d.vid),
+				"pid", fmt.Sprintf("%04x", d.pid),
+				"err", err)
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+			}
+			continue
+		}
+
+		d.mu.Lock()
+		d.port = dev
+		d.mu.Unlock()
+		slog.Info("HID device connected",
+			"vid", fmt.Sprintf("%04x", d.vid),
+			"pid", fmt.Sprintf("%04x", d.pid))
+
+		// Block until the read loop exits (disconnect or ctx cancel).
+		d.runReadLoop(dev)
+
+		// Clean up after disconnect.
+		d.mu.Lock()
+		d.port = nil
+		d.mu.Unlock()
+		dev.Close() //nolint:errcheck
+
+		d.drainPending()
+		d.shutdownRelay()
+
+		select {
+		case <-d.ctx.Done():
+			return
+		default:
+			slog.Info("HID device disconnected, will reconnect",
+				"vid", fmt.Sprintf("%04x", d.vid),
+				"pid", fmt.Sprintf("%04x", d.pid))
+		}
+	}
+}
+
+// runReadLoop reads HID IN reports until an error or ctx cancellation.
+// It does NOT close d.port — the caller (manage) owns that.
+func (d *Device) runReadLoop(port *hid.Device) {
 	parser := proto.NewParser(func(f proto.Frame) {
 		if f.IsResp {
-			// Response to a pending request — match by seq.
 			d.pendingMu.Lock()
 			ch, ok := d.pending[f.Seq]
 			if ok {
@@ -366,12 +455,12 @@ func (d *Device) readLoop() {
 				}
 			}
 		} else {
-			// Unsolicited push from the device.
 			d.dispatchPush(f)
 		}
 	})
 
-	buf := make([]byte, readBufSize)
+	buf := make([]byte, hidReportSize)
+
 	for {
 		select {
 		case <-d.ctx.Done():
@@ -379,28 +468,29 @@ func (d *Device) readLoop() {
 		default:
 		}
 
-		d.mu.Lock()
-		port := d.port
-		d.mu.Unlock()
-		if port == nil {
-			return
-		}
-
-		n, err := port.Read(buf)
+		n, err := port.ReadWithTimeout(buf, readTimeout)
 		if err != nil {
+			if errors.Is(err, hid.ErrTimeout) || err.Error() == "Interrupted system call" {
+				continue
+			}
 			select {
 			case <-d.ctx.Done():
-				return
 			default:
-				slog.Warn("serial read error", "err", err)
-				d.mu.Lock()
-				d.port = nil
-				d.mu.Unlock()
-				return
+				slog.Warn("HID read error", "err", err)
 			}
+			return
 		}
-		if n > 0 {
-			parser.Feed(buf[:n])
+		if n < 1 {
+			continue // timeout or empty report
+		}
+
+		// Report format: buf[0]=data_len, buf[1..data_len]=proto bytes
+		dataLen := int(buf[0])
+		if dataLen > hidPayloadSize || dataLen > n-1 {
+			dataLen = n - 1
+		}
+		if dataLen > 0 {
+			parser.Feed(buf[1 : 1+dataLen])
 		}
 	}
 }

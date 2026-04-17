@@ -5,6 +5,7 @@ idf_component_register(
         "wifi_mgr.c"
         "cpu_monitor.c"
         "tcp_mgr.c"
+        "hid_transport.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash

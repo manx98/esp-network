@@ -3,12 +3,14 @@ package main
 import (
 	"embed"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/manx98/esp32-ctrl/api"
 	"github.com/manx98/esp32-ctrl/device"
@@ -19,9 +21,20 @@ import (
 //go:embed static
 var staticFiles embed.FS
 
+func parseHex(s string) (uint16, error) {
+	s = strings.TrimPrefix(strings.ToLower(s), "0x")
+	v, err := strconv.ParseUint(s, 16, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid hex value %q: %w", s, err)
+	}
+	return uint16(v), nil
+}
+
 func main() {
-	port := flag.String("port", "/dev/ttyACM0", "Serial port (e.g. /dev/ttyACM0 or COM3)")
-	baud := flag.Int("baud", 115200, "Baud rate")
+	vid := flag.String("vid", fmt.Sprintf("0x%04X", device.DefaultVID),
+		"USB Vendor ID of the ESP32 HID device (e.g. 0x303A)")
+	pid := flag.String("pid", fmt.Sprintf("0x%04X", device.DefaultPID),
+		"USB Product ID of the ESP32 HID device (e.g. 0x4004)")
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	socks5Addr := flag.String("socks5", ":1080", "Proxy listen address for SOCKS5+HTTP/HTTPS (empty to disable)")
 	proxyAddr := flag.String("proxy", "", "External proxy server address (e.g. localhost:11080)")
@@ -34,10 +47,21 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	dev := device.New(*port, *baud)
+	vidN, err := parseHex(*vid)
+	if err != nil {
+		slog.Error("invalid --vid", "err", err)
+		os.Exit(1)
+	}
+	pidN, err := parseHex(*pid)
+	if err != nil {
+		slog.Error("invalid --pid", "err", err)
+		os.Exit(1)
+	}
+
+	dev := device.New(vidN, pidN)
 	if err := dev.Open(); err != nil {
-		slog.Warn("could not open serial port; UI will show 'not connected'",
-			"port", *port, "err", err)
+		slog.Error("failed to initialise HID", "err", err)
+		os.Exit(1)
 	}
 	defer dev.Close()
 
@@ -75,7 +99,7 @@ func main() {
 
 	handler := api.WithCORS(api.WithLogging(mux))
 
-	slog.Info("starting", "addr", *addr, "port", *port)
+	slog.Info("starting", "addr", *addr, "vid", *vid, "pid", *pid)
 	if err := http.ListenAndServe(*addr, handler); err != nil {
 		slog.Error("server error", "err", err)
 		os.Exit(1)
