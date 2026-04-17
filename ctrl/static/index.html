@@ -62,6 +62,10 @@
     <div class="row" style="margin-bottom:.75rem">
       <button class="btn-primary" onclick="doPing()">Ping</button>
       <button class="btn-danger"  onclick="doReset()">重启设备</button>
+      <label style="display:flex;align-items:center;gap:.4rem;font-size:.85rem;font-weight:500;cursor:pointer;margin-left:auto">
+        <input type="checkbox" id="ledToggle" onchange="doLedSet(this.checked)" style="width:auto">
+        状态指示灯
+      </label>
     </div>
     <div id="sysInfo" class="info-grid"></div>
   </div>
@@ -151,10 +155,11 @@ function infoGrid(container, items) {
 // ── Poll device + WiFi status every 3 s ─────────────────────────────────────
 async function pollStatus() {
   try {
-    const [dev, wifi, info] = await Promise.all([
+    const [dev, wifi, info, led] = await Promise.all([
       api('GET', '/api/status'),
       api('GET', '/api/wifi/status').catch(() => null),
       api('GET', '/api/info').catch(() => null),
+      api('GET', '/api/led').catch(() => null),
     ]);
 
     const devBadge = document.getElementById('devBadge');
@@ -171,6 +176,10 @@ async function pollStatus() {
     }
 
     if (info && !info.error) renderDevInfo(info);
+    if (led && !led.error) {
+      const cb = document.getElementById('ledToggle');
+      if (!cb._userChanging) cb.checked = led.enabled;
+    }
   } catch (e){
     console.error(e)
   }
@@ -234,6 +243,16 @@ function renderWifiStatus(s) {
 
 setInterval(pollStatus, 3000);
 pollStatus();
+
+// ── LED ───────────────────────────────────────────────────────────────────────
+async function doLedSet(enabled) {
+  const cb = document.getElementById('ledToggle');
+  cb._userChanging = true;
+  const r = await api('POST', '/api/led', { enabled });
+  cb._userChanging = false;
+  if (r.error) { toast(r.error, 'err'); cb.checked = !enabled; return; }
+  toast('状态指示灯已' + (enabled ? '开启' : '关闭'));
+}
 
 // ── System ───────────────────────────────────────────────────────────────────
 async function doPing() {

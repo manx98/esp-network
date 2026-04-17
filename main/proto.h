@@ -36,6 +36,8 @@ typedef enum {
     CMD_PING            = 0x01,  /* → "PONG" */
     CMD_GET_DEV_INFO    = 0x02,  /* → [fw_ver_str] */
     CMD_RESET           = 0x03,  /* restart device */
+    CMD_LED_SET         = 0x04,  /* [enabled:1]  0=off 1=on */
+    CMD_LED_GET         = 0x05,  /* → [enabled:1] */
 
     /* WiFi STA */
     CMD_WIFI_SET_CONFIG = 0x10,  /* [ssid_len:1][ssid][pass_len:1][pass] */

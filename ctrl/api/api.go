@@ -39,6 +39,8 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/info", a.handleGetDevInfo)
 	mux.HandleFunc("POST /api/reset", a.handleReset)
 	mux.HandleFunc("GET /api/status", a.handleDeviceStatus)
+	mux.HandleFunc("POST /api/led", a.handleLedSet)
+	mux.HandleFunc("GET /api/led", a.handleLedGet)
 
 	// WiFi
 	mux.HandleFunc("POST /api/wifi/config", a.handleWifiSetConfig)
@@ -168,6 +170,51 @@ func (a *API) handleReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ── LED handlers ─────────────────────────────────────────────────────────────
+
+type ledReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (a *API) handleLedSet(w http.ResponseWriter, r *http.Request) {
+	var req ledReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	enabled := byte(0)
+	if req.Enabled {
+		enabled = 1
+	}
+	f, err := a.send(r, proto.CmdLedSet, []byte{enabled})
+	if err != nil {
+		writeErr(w, http.StatusGatewayTimeout, err.Error())
+		return
+	}
+	if err := checkStatus(f); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *API) handleLedGet(w http.ResponseWriter, r *http.Request) {
+	f, err := a.send(r, proto.CmdLedGet, nil)
+	if err != nil {
+		writeErr(w, http.StatusGatewayTimeout, err.Error())
+		return
+	}
+	if err := checkStatus(f); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if len(f.Payload) < 1 {
+		writeErr(w, http.StatusBadGateway, "short payload")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"enabled": f.Payload[0] != 0})
 }
 
 // ── WiFi handlers ─────────────────────────────────────────────────────────────

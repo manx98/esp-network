@@ -30,9 +30,11 @@ type Cmd byte
 //	0x30–0x3F  OTA     (reserved)
 //	0x40–0x7E  User-defined
 const (
-	CmdPing           Cmd = 0x01
-	CmdGetDevInfo     Cmd = 0x02
-	CmdReset          Cmd = 0x03
+	CmdPing       Cmd = 0x01
+	CmdGetDevInfo Cmd = 0x02
+	CmdReset      Cmd = 0x03
+	CmdLedSet     Cmd = 0x04 // [enabled:1]  0=off 1=on
+	CmdLedGet     Cmd = 0x05 // → [enabled:1]
 	CmdWifiSetConfig  Cmd = 0x10
 	CmdWifiGetConfig  Cmd = 0x11
 	CmdWifiConnect      Cmd = 0x12

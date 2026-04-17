@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
@@ -20,14 +21,22 @@
 
 static const char *TAG = "main";
 
+#define LED_NVS_NS   "led_cfg"
+#define LED_NVS_KEY  "enabled"
+
 /* ── LED ── */
 #define LED_GPIO            GPIO_NUM_15
 #define LED_TIMER_PERIOD_US (50 * 1000)   /* 50 ms */
 
 static atomic_int s_data_active = 0;
+static atomic_int s_led_enabled = 1;  /* 1 = 开启状态指示，0 = 关闭 */
 
 static void led_timer_cb(void *arg)
 {
+    if (!atomic_load(&s_led_enabled)) {
+        gpio_set_level(LED_GPIO, 0);
+        return;
+    }
     if (atomic_exchange(&s_data_active, 0)) {
         gpio_set_level(LED_GPIO, 1);
     } else {
@@ -115,6 +124,31 @@ static void cdc_send_push(uint8_t cmd, const uint8_t *data, size_t data_len)
 }
 
 /* ── Command handlers ── */
+
+static void handle_led_set(const proto_frame_t *f)
+{
+    if (f->payload_len < 1) {
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
+        return;
+    }
+    uint8_t val = f->payload[0] ? 1 : 0;
+    atomic_store(&s_led_enabled, val);
+
+    nvs_handle_t nvs;
+    if (nvs_open(LED_NVS_NS, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, LED_NVS_KEY, val);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, NULL, 0);
+}
+
+static void handle_led_get(const proto_frame_t *f)
+{
+    uint8_t enabled = (uint8_t)atomic_load(&s_led_enabled);
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, &enabled, 1);
+}
 
 static void handle_ping(const proto_frame_t *f)
 {
@@ -402,6 +436,8 @@ static void on_frame(const proto_frame_t *f, void *ctx)
     case CMD_PING:               handle_ping(f);               break;
     case CMD_GET_DEV_INFO:       handle_get_dev_info(f);       break;
     case CMD_RESET:              handle_reset(f);              break;
+    case CMD_LED_SET:            handle_led_set(f);            break;
+    case CMD_LED_GET:            handle_led_get(f);            break;
     case CMD_WIFI_SET_CONFIG:    handle_wifi_set_config(f);    break;
     case CMD_WIFI_GET_CONFIG:    handle_wifi_get_config(f);    break;
     case CMD_WIFI_CONNECT:       handle_wifi_connect(f);       break;
@@ -478,6 +514,17 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* 恢复 LED 开关状态 */
+    {
+        nvs_handle_t nvs;
+        if (nvs_open(LED_NVS_NS, NVS_READONLY, &nvs) == ESP_OK) {
+            uint8_t val = 1;
+            nvs_get_u8(nvs, LED_NVS_KEY, &val);
+            nvs_close(nvs);
+            atomic_store(&s_led_enabled, val);
+        }
+    }
 
     /* LED GPIO */
     gpio_config_t io_cfg = {
