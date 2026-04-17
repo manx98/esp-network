@@ -5,15 +5,17 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "wifi_mgr";
 
-#define NVS_NS        "wifi_mgr"
-#define NVS_KEY_SSID  "ssid"
-#define NVS_KEY_PASS  "pass"
+#define NVS_NS            "wifi_mgr"
+#define NVS_KEY_SSID      "ssid"
+#define NVS_KEY_PASS      "pass"
+#define NVS_KEY_HOSTNAME  "hostname"
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAILED_BIT     BIT1
@@ -84,6 +86,22 @@ esp_err_t wifi_mgr_init(void)
         IP_EVENT, ESP_EVENT_ANY_ID, on_ip_event, NULL, NULL));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    /* 应用已存储的 hostname（若有） */
+    char hostname[WIFI_MGR_HOSTNAME_MAX + 1];
+    if (wifi_mgr_get_hostname(hostname, sizeof(hostname)) == ESP_OK) {
+        esp_netif_set_hostname(s_sta_netif, hostname);
+        ESP_LOGI(TAG, "Hostname: %s", hostname);
+    }
+
+    /* 每次启动使用随机 MAC（本地管理单播地址） */
+    uint8_t mac[6];
+    esp_fill_random(mac, sizeof(mac));
+    mac[0] = (mac[0] & 0xFE) | 0x02;  /* 清除多播位，置位本地管理位 */
+    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, mac));
+    ESP_LOGI(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "WiFi manager initialized");
@@ -220,4 +238,38 @@ int wifi_mgr_scan(wifi_mgr_ap_info_t *ap_list, int max_count)
 
     free(records);
     return (int)count;
+}
+
+esp_err_t wifi_mgr_set_hostname(const char *hostname)
+{
+    if (!hostname || strlen(hostname) == 0 ||
+        strlen(hostname) > WIFI_MGR_HOSTNAME_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(NVS_NS, NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) return ret;
+
+    ret = nvs_set_str(nvs, NVS_KEY_HOSTNAME, hostname);
+    if (ret == ESP_OK) ret = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (ret != ESP_OK) return ret;
+
+    ret = esp_netif_set_hostname(s_sta_netif, hostname);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Hostname set: %s", hostname);
+    }
+    return ret;
+}
+
+esp_err_t wifi_mgr_get_hostname(char *out, size_t out_size)
+{
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(NVS_NS, NVS_READONLY, &nvs);
+    if (ret != ESP_OK) return ret;
+
+    ret = nvs_get_str(nvs, NVS_KEY_HOSTNAME, out, &out_size);
+    nvs_close(nvs);
+    return ret;
 }

@@ -47,6 +47,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/wifi/disconnect", a.handleWifiDisconnect)
 	mux.HandleFunc("GET /api/wifi/status", a.handleWifiGetStatus)
 	mux.HandleFunc("GET /api/wifi/scan", a.handleWifiScan)
+
+	// Hostname
+	mux.HandleFunc("POST /api/wifi/hostname", a.handleWifiSetHostname)
+	mux.HandleFunc("GET /api/wifi/hostname", a.handleWifiGetHostname)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -369,6 +373,64 @@ func (a *API) handleWifiScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"aps": aps})
+}
+
+// ── Hostname handlers ─────────────────────────────────────────────────────────
+
+type hostnameReq struct {
+	Hostname string `json:"hostname"`
+}
+
+func (a *API) handleWifiSetHostname(w http.ResponseWriter, r *http.Request) {
+	var req hostnameReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if len(req.Hostname) == 0 || len(req.Hostname) > 32 {
+		writeErr(w, http.StatusBadRequest, "hostname must be 1–32 bytes")
+		return
+	}
+
+	h := []byte(req.Hostname)
+	payload := make([]byte, 1+len(h))
+	payload[0] = byte(len(h))
+	copy(payload[1:], h)
+
+	f, err := a.send(r, proto.CmdWifiSetHostname, payload)
+	if err != nil {
+		writeErr(w, http.StatusGatewayTimeout, err.Error())
+		return
+	}
+	if err := checkStatus(f); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *API) handleWifiGetHostname(w http.ResponseWriter, r *http.Request) {
+	f, err := a.send(r, proto.CmdWifiGetHostname, nil)
+	if err != nil {
+		writeErr(w, http.StatusGatewayTimeout, err.Error())
+		return
+	}
+	if err := checkStatus(f); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	p := f.Payload
+	if len(p) < 1 {
+		writeErr(w, http.StatusBadGateway, "short payload")
+		return
+	}
+	hlen := int(p[0])
+	if len(p) < 1+hlen {
+		writeErr(w, http.StatusBadGateway, "truncated payload")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"hostname": string(p[1 : 1+hlen])})
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────

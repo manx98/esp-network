@@ -3,9 +3,10 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
-#define WIFI_MGR_SSID_MAX  32
-#define WIFI_MGR_PASS_MAX  64
-#define WIFI_MGR_SCAN_MAX  20
+#define WIFI_MGR_SSID_MAX      32
+#define WIFI_MGR_PASS_MAX      64
+#define WIFI_MGR_SCAN_MAX      20
+#define WIFI_MGR_HOSTNAME_MAX  32
 
 typedef enum {
     WIFI_MGR_STATE_DISCONNECTED = 0,
@@ -58,3 +59,9 @@ void wifi_mgr_get_status(wifi_mgr_status_t *out);
  * Returns number of APs found, or -1 on error.
  */
 int wifi_mgr_scan(wifi_mgr_ap_info_t *ap_list, int max_count);
+
+/** Persist hostname to NVS and apply to netif immediately. */
+esp_err_t wifi_mgr_set_hostname(const char *hostname);
+
+/** Read stored hostname from NVS. Returns ESP_ERR_NVS_NOT_FOUND if not set. */
+esp_err_t wifi_mgr_get_hostname(char *out, size_t out_size);

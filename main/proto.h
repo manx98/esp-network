@@ -40,10 +40,12 @@ typedef enum {
     /* WiFi STA */
     CMD_WIFI_SET_CONFIG = 0x10,  /* [ssid_len:1][ssid][pass_len:1][pass] */
     CMD_WIFI_GET_CONFIG = 0x11,  /* → [ssid_len:1][ssid][pass_len:1][**masked**] */
-    CMD_WIFI_CONNECT    = 0x12,  /* connect with stored config */
-    CMD_WIFI_DISCONNECT = 0x13,  /* disconnect */
-    CMD_WIFI_GET_STATUS = 0x14,  /* → [state:1][ip:4] */
-    CMD_WIFI_SCAN       = 0x15,  /* → [count:1]([ssid_len:1][ssid][rssi:1][auth:1])* */
+    CMD_WIFI_CONNECT      = 0x12,  /* connect with stored config */
+    CMD_WIFI_DISCONNECT   = 0x13,  /* disconnect */
+    CMD_WIFI_GET_STATUS   = 0x14,  /* → [state:1][ip:4] */
+    CMD_WIFI_SCAN         = 0x15,  /* → [count:1]([ssid_len:1][ssid][rssi:1][auth:1])* */
+    CMD_WIFI_SET_HOSTNAME = 0x16,  /* [hostname_len:1][hostname] */
+    CMD_WIFI_GET_HOSTNAME = 0x17,  /* → [hostname_len:1][hostname] */
 
     /* Proxy relay — single long-lived TCP connection to proxy server (0x20–0x2F)
      * ctrl multiplexes all traffic over this one connection using the proxy

@@ -95,6 +95,19 @@
     </div>
   </div>
 
+  <!-- Hostname -->
+  <div class="card">
+    <h2>Hostname 配置</h2>
+    <div class="row">
+      <div class="field">
+        <label>Hostname（1–32 字节）</label>
+        <input id="inHostname" type="text" placeholder="esp32" maxlength="32">
+      </div>
+      <button class="btn-primary" onclick="doSetHostname()">保存</button>
+      <button class="btn-gray"    onclick="doGetHostname()">读取</button>
+    </div>
+  </div>
+
   <!-- Scan -->
   <div class="card">
     <h2>WiFi 扫描</h2>
@@ -275,6 +288,22 @@ async function doGetStatus() {
   if (r.error) { toast(r.error, 'err'); return; }
   renderWifiStatus(r);
   updateWifiButtons(r);
+}
+
+// ── Hostname ─────────────────────────────────────────────────────────────────
+async function doSetHostname() {
+  const hostname = document.getElementById('inHostname').value.trim();
+  if (!hostname) { toast('请输入 Hostname', 'err'); return; }
+  const r = await api('POST', '/api/wifi/hostname', { hostname });
+  if (r.error) { toast(r.error, 'err'); return; }
+  toast('Hostname 已保存');
+}
+
+async function doGetHostname() {
+  const r = await api('GET', '/api/wifi/hostname');
+  if (r.error) { toast(r.error, 'err'); return; }
+  document.getElementById('inHostname').value = r.hostname;
+  toast('Hostname: ' + r.hostname);
 }
 
 // ── Scan ─────────────────────────────────────────────────────────────────────

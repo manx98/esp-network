@@ -268,6 +268,43 @@ static void handle_wifi_get_status(const proto_frame_t *f)
     cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, sizeof(buf));
 }
 
+static void handle_wifi_set_hostname(const proto_frame_t *f)
+{
+    const uint8_t *p = f->payload;
+    size_t rem = f->payload_len;
+
+    if (rem < 1) goto bad_arg;
+    uint8_t hlen = *p++;  rem--;
+    if (rem < hlen || hlen == 0 || hlen > WIFI_MGR_HOSTNAME_MAX) goto bad_arg;
+
+    char hostname[WIFI_MGR_HOSTNAME_MAX + 1] = {0};
+    memcpy(hostname, p, hlen);
+
+    esp_err_t ret = wifi_mgr_set_hostname(hostname);
+    cdc_send_response(f->seq, f->cmd,
+                      ret == ESP_OK ? PROTO_STATUS_OK : PROTO_STATUS_ERROR,
+                      NULL, 0);
+    return;
+
+bad_arg:
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_INVALID, NULL, 0);
+}
+
+static void handle_wifi_get_hostname(const proto_frame_t *f)
+{
+    char hostname[WIFI_MGR_HOSTNAME_MAX + 1] = {0};
+    esp_err_t ret = wifi_mgr_get_hostname(hostname, sizeof(hostname));
+    if (ret != ESP_OK) {
+        cdc_send_response(f->seq, f->cmd, PROTO_STATUS_ERROR, NULL, 0);
+        return;
+    }
+    uint8_t hlen = (uint8_t)strlen(hostname);
+    uint8_t buf[1 + WIFI_MGR_HOSTNAME_MAX];
+    buf[0] = hlen;
+    memcpy(&buf[1], hostname, hlen);
+    cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, 1 + hlen);
+}
+
 static void handle_wifi_scan(const proto_frame_t *f)
 {
     wifi_mgr_ap_info_t *aps = malloc(sizeof(wifi_mgr_ap_info_t) * WIFI_MGR_SCAN_MAX);
@@ -371,6 +408,8 @@ static void on_frame(const proto_frame_t *f, void *ctx)
     case CMD_WIFI_DISCONNECT:    handle_wifi_disconnect(f);    break;
     case CMD_WIFI_GET_STATUS:    handle_wifi_get_status(f);    break;
     case CMD_WIFI_SCAN:          handle_wifi_scan(f);          break;
+    case CMD_WIFI_SET_HOSTNAME:  handle_wifi_set_hostname(f);  break;
+    case CMD_WIFI_GET_HOSTNAME:  handle_wifi_get_hostname(f);  break;
     case CMD_PROXY_CONNECT:      handle_proxy_connect(f);      break;
     case CMD_PROXY_SEND:         handle_proxy_send(f);         break;
     case CMD_PROXY_DISCONNECT:   handle_proxy_disconnect(f);   break;

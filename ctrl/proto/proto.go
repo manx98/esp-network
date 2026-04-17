@@ -35,10 +35,12 @@ const (
 	CmdReset          Cmd = 0x03
 	CmdWifiSetConfig  Cmd = 0x10
 	CmdWifiGetConfig  Cmd = 0x11
-	CmdWifiConnect    Cmd = 0x12
-	CmdWifiDisconnect Cmd = 0x13
-	CmdWifiGetStatus  Cmd = 0x14
-	CmdWifiScan       Cmd = 0x15
+	CmdWifiConnect      Cmd = 0x12
+	CmdWifiDisconnect   Cmd = 0x13
+	CmdWifiGetStatus    Cmd = 0x14
+	CmdWifiScan         Cmd = 0x15
+	CmdWifiSetHostname  Cmd = 0x16 // [hostname_len:1][hostname]
+	CmdWifiGetHostname  Cmd = 0x17 // → [hostname_len:1][hostname]
 
 	// Proxy relay — single long-lived TCP connection to the proxy server (0x20–0x2F).
 	// The ctrl side handles proxy-protocol framing; ESP32 is a transparent relay.
