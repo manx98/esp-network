@@ -89,7 +89,7 @@
         <label>SSID</label>
         <input id="inSSID" type="text" placeholder="网络名称" maxlength="32">
       </div>
-      <div class="field">
+      <div class="field" id="passField">
         <label>密码</label>
         <input id="inPass" type="password" placeholder="密码" maxlength="64">
       </div>
@@ -284,6 +284,7 @@ async function doGetConfig() {
   if (r.error) { toast(r.error, 'err'); return; }
   document.getElementById('inSSID').value = r.ssid;
   document.getElementById('inPass').value = r.password;
+  setPassVisible(r.password !== '');
   toast('配置已读取');
 }
 
@@ -346,7 +347,7 @@ async function doScan() {
       const pct = Math.max(0, Math.min(100, 2 * (ap.rssi + 100)));
       const color = pct > 60 ? '#22c55e' : pct > 30 ? '#f59e0b' : '#ef4444';
       const auth = authNames[ap.authmode] || '未知';
-      return `<tr onclick="selectAP('${escHtml(ap.ssid)}')">
+      return `<tr onclick="selectAP('${escHtml(ap.ssid)}',${ap.authmode===0})">
         <td>${escHtml(ap.ssid)}</td>
         <td><span class="rssi-bar" style="width:${pct}px;background:${color}"></span> ${ap.rssi} dBm</td>
         <td>${auth}</td>
@@ -360,10 +361,16 @@ async function doScan() {
   }
 }
 
-function selectAP(ssid) {
+function selectAP(ssid, isOpen) {
   document.getElementById('inSSID').value = ssid;
-  document.getElementById('inPass').focus();
+  document.getElementById('inPass').value = '';
+  setPassVisible(!isOpen);
+  if (!isOpen) document.getElementById('inPass').focus();
   toast('已选择: ' + ssid);
+}
+
+function setPassVisible(visible) {
+  document.getElementById('passField').style.display = visible ? '' : 'none';
 }
 
 function escHtml(s) {
