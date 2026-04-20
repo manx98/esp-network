@@ -561,7 +561,6 @@ void app_main(void)
 
     /* TCP manager (SOCKS5 tunnelling) */
     tcp_mgr_init(cdc_send_push);
-    wifi_mgr_connect();
     /* TinyUSB */
     const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));

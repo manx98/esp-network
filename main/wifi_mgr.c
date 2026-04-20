@@ -1,6 +1,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -21,10 +22,38 @@ static const char *TAG = "wifi_mgr";
 #define WIFI_FAILED_BIT     BIT1
 #define WIFI_SCAN_DONE_BIT  BIT2
 
+#define RECONNECT_INTERVAL_MS  3000
+
 static EventGroupHandle_t s_wifi_eg;
 static esp_netif_t       *s_sta_netif = NULL;
 static volatile wifi_mgr_state_t s_state = WIFI_MGR_STATE_DISCONNECTED;
 static uint8_t            s_ip[4] = {0};
+static volatile bool      s_auto_reconnect = false;
+static TimerHandle_t      s_reconnect_timer = NULL;
+
+/* ── Reconnect timer callback ── */
+
+static void reconnect_timer_cb(TimerHandle_t xTimer)
+{
+    if (!s_auto_reconnect) return;
+    if (s_state == WIFI_MGR_STATE_CONNECTED || s_state == WIFI_MGR_STATE_CONNECTING) return;
+
+    wifi_mgr_config_t cfg = {0};
+    if (wifi_mgr_get_config(&cfg) != ESP_OK) return;
+
+    wifi_config_t wifi_cfg = {0};
+    strncpy((char *)wifi_cfg.sta.ssid,     cfg.ssid,     sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, cfg.password, sizeof(wifi_cfg.sta.password) - 1);
+    wifi_cfg.sta.threshold.authmode =
+        (cfg.password[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+    esp_err_t ret = esp_wifi_connect();
+    if (ret == ESP_OK) {
+        s_state = WIFI_MGR_STATE_CONNECTING;
+        ESP_LOGI(TAG, "Auto-reconnect attempt");
+    }
+}
 
 /* ── Event handlers ── */
 
@@ -42,6 +71,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
         memset(s_ip, 0, sizeof(s_ip));
         s_state = WIFI_MGR_STATE_DISCONNECTED;
         xEventGroupSetBits(s_wifi_eg, WIFI_FAILED_BIT);
+        if (s_auto_reconnect && s_reconnect_timer) {
+            xTimerStart(s_reconnect_timer, 0);
+        }
     } else if (id == WIFI_EVENT_SCAN_DONE) {
         xEventGroupSetBits(s_wifi_eg, WIFI_SCAN_DONE_BIT);
     }
@@ -72,6 +104,12 @@ static void on_ip_event(void *arg, esp_event_base_t base,
 esp_err_t wifi_mgr_init(void)
 {
     s_wifi_eg = xEventGroupCreate();
+    s_reconnect_timer = xTimerCreate("wifi_reconnect",
+                                     pdMS_TO_TICKS(RECONNECT_INTERVAL_MS),
+                                     pdTRUE,  /* auto-reload */
+                                     NULL,
+                                     reconnect_timer_cb);
+    configASSERT(s_reconnect_timer);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -103,6 +141,12 @@ esp_err_t wifi_mgr_init(void)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* 若 NVS 中已有配置，启动时自动尝试连接 */
+    wifi_mgr_config_t saved = {0};
+    if (wifi_mgr_get_config(&saved) == ESP_OK) {
+        wifi_mgr_connect();
+    }
 
     ESP_LOGI(TAG, "WiFi manager initialized");
     return ESP_OK;
@@ -165,6 +209,7 @@ esp_err_t wifi_mgr_connect(void)
 
     xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT);
     s_state = WIFI_MGR_STATE_CONNECTING;
+    s_auto_reconnect = true;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ret = esp_wifi_connect();
@@ -176,6 +221,8 @@ esp_err_t wifi_mgr_connect(void)
 
 esp_err_t wifi_mgr_disconnect(void)
 {
+    s_auto_reconnect = false;
+    if (s_reconnect_timer) xTimerStop(s_reconnect_timer, 0);
     esp_err_t ret = esp_wifi_disconnect();
     if (ret == ESP_OK) {
         s_state = WIFI_MGR_STATE_DISCONNECTED;
