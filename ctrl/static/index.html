@@ -213,6 +213,8 @@ function renderDevInfo(d) {
     ['任务数量', d.task_count],
     ['接收', fmtBytes(d.rx_bytes)],
     ['发送', fmtBytes(d.tx_bytes)],
+    ...(d.temp_c !== undefined ? [['CPU 温度', d.temp_c + ' °C']] : []),
+    ...(d.cpu_freq_mhz !== undefined ? [['CPU 频率', d.cpu_freq_mhz + ' MHz']] : []),
   ]);
 }
 

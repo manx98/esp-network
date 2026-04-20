@@ -11,6 +11,8 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
+#include "driver/temp_sensor.h"
+#include "esp_private/esp_clk.h"
 #include "tinyusb.h"
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_default_config.h"
@@ -168,6 +170,10 @@ static void handle_get_dev_info(const proto_frame_t *f)
      *   [cpu_load   : 1]   uint8  0–100 %
      *   [uptime_s   : 4]   uint32 LE  (seconds since boot)
      *   [task_count : 2]   uint16 LE
+     *   [rx_bytes   : 8]   uint64 LE
+     *   [tx_bytes   : 8]   uint64 LE
+     *   [temp_c     : 1]   int8   CPU temperature in °C
+     *   [cpu_freq   : 2]   uint16 LE  CPU frequency in MHz
      */
     const char *ver     = esp_get_idf_version();
     uint8_t     ver_len = (uint8_t)strlen(ver);
@@ -181,8 +187,13 @@ static void handle_get_dev_info(const proto_frame_t *f)
     uint64_t tx_bytes;
     uint64_t rx_bytes;
     tcp_mgr_get_bytes(&rx_bytes, &tx_bytes);
-    /* 1(ver_len) + 64(ver) + 4+4+4(heap) + 1(cpu) + 4(uptime) + 2(tasks) + 8+8(bytes) */
-    uint8_t buf[1 + 64 + 4 + 4 + 4 + 1 + 4 + 2 + 8 + 8];
+    float    temp_f = 0.0f;
+    temp_sensor_read_celsius(&temp_f);
+    int8_t   temp_c    = (int8_t)temp_f;
+    uint16_t cpu_freq  = (uint16_t)(esp_clk_cpu_freq() / 1000000);
+
+    /* 1(ver_len) + 64(ver) + 4+4+4(heap) + 1(cpu) + 4(uptime) + 2(tasks) + 8+8(bytes) + 1(temp) + 2(freq) */
+    uint8_t buf[1 + 64 + 4 + 4 + 4 + 1 + 4 + 2 + 8 + 8 + 1 + 2];
     size_t n = 0;
 
     buf[n++] = ver_len;
@@ -212,6 +223,9 @@ n += 8; \
     buf[n++] = (uint8_t)(task_count >> 8);
     PUT_U64(rx_bytes);
     PUT_U64(tx_bytes);
+    buf[n++] = (uint8_t)temp_c;
+    buf[n++] = (uint8_t)(cpu_freq & 0xFF);
+    buf[n++] = (uint8_t)(cpu_freq >> 8);
 #undef PUT_U32
 #undef PUT_U64
 
@@ -543,6 +557,11 @@ void app_main(void)
     esp_timer_handle_t led_timer;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &led_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(led_timer, LED_TIMER_PERIOD_US));
+
+    /* Temperature sensor */
+    temp_sensor_config_t temp_cfg = TSENS_CONFIG_DEFAULT();
+    temp_sensor_set_config(temp_cfg);
+    temp_sensor_start();
 
     /* CPU monitor */
     cpu_monitor_init();

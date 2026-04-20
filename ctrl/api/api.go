@@ -126,7 +126,7 @@ func (a *API) handleGetDevInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	verLen := int(p[0])
 	p = p[1:]
-	if len(p) < verLen+15 { // 3×4 + 1 + 4 + 2 = 15
+	if len(p) < verLen+16 { // 3×4 + 1 + 4 + 2 + 8 + 8 + 1 = 36, min check
 		writeErr(w, http.StatusBadGateway, "truncated payload")
 		return
 	}
@@ -148,7 +148,7 @@ func (a *API) handleGetDevInfo(w http.ResponseWriter, r *http.Request) {
 		heapUsedPct = (totalHeap - freeHeap) * 100 / totalHeap
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"fw_version":    fwVer,
 		"free_heap":     freeHeap,
 		"total_heap":    totalHeap,
@@ -159,7 +159,14 @@ func (a *API) handleGetDevInfo(w http.ResponseWriter, r *http.Request) {
 		"task_count":    taskCount,
 		"tx_bytes":      binary.LittleEndian.Uint64(p[19:27]),
 		"rx_bytes":      binary.LittleEndian.Uint64(p[27:35]),
-	})
+	}
+	if len(p) >= 36 {
+		resp["temp_c"] = int8(p[35])
+	}
+	if len(p) >= 38 {
+		resp["cpu_freq_mhz"] = uint16(p[36]) | uint16(p[37])<<8
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *API) handleReset(w http.ResponseWriter, r *http.Request) {
