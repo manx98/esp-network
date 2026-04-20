@@ -110,8 +110,10 @@ esp_err_t wifi_mgr_init(void)
 
 esp_err_t wifi_mgr_set_config(const char *ssid, const char *password)
 {
-    if (!ssid || strlen(ssid) > WIFI_MGR_SSID_MAX ||
-        !password || strlen(password) > WIFI_MGR_PASS_MAX) {
+    if (!ssid || strlen(ssid) == 0 || strlen(ssid) > WIFI_MGR_SSID_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (password && strlen(password) > WIFI_MGR_PASS_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -120,7 +122,7 @@ esp_err_t wifi_mgr_set_config(const char *ssid, const char *password)
     if (ret != ESP_OK) return ret;
 
     ret = nvs_set_str(nvs, NVS_KEY_SSID, ssid);
-    if (ret == ESP_OK) ret = nvs_set_str(nvs, NVS_KEY_PASS, password);
+    if (ret == ESP_OK) ret = nvs_set_str(nvs, NVS_KEY_PASS, password ? password : "");
     if (ret == ESP_OK) ret = nvs_commit(nvs);
     nvs_close(nvs);
 
@@ -158,7 +160,8 @@ esp_err_t wifi_mgr_connect(void)
     wifi_config_t wifi_cfg = {0};
     strncpy((char *)wifi_cfg.sta.ssid,     cfg.ssid,     sizeof(wifi_cfg.sta.ssid) - 1);
     strncpy((char *)wifi_cfg.sta.password, cfg.password, sizeof(wifi_cfg.sta.password) - 1);
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_cfg.sta.threshold.authmode =
+        (cfg.password[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 
     xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT);
     s_state = WIFI_MGR_STATE_CONNECTING;
