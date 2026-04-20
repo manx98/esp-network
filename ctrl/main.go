@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/manx98/esp32-ctrl/api"
 	"github.com/manx98/esp32-ctrl/device"
@@ -25,6 +26,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	socks5Addr := flag.String("socks5", ":1080", "Proxy listen address for SOCKS5+HTTP/HTTPS (empty to disable)")
 	proxyAddr := flag.String("proxy", "", "External proxy server address (e.g. localhost:11080)")
+	auth := flag.String("auth", "", "HTTP Basic Auth credentials in user:password format (empty to disable)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
@@ -73,7 +75,20 @@ func main() {
 	staticFS, _ := fs.Sub(staticFiles, "static")
 	mux.Handle("/", http.FileServer(http.FS(staticFS)))
 
-	handler := api.WithCORS(api.WithLogging(mux))
+	var handler http.Handler = api.WithCORS(api.WithLogging(mux))
+	if *auth != "" {
+		parts := strings.SplitN(*auth, ":", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			slog.Error("--auth must be in user:password format")
+			os.Exit(1)
+		}
+		sa := api.NewSessionAuth(parts[0], parts[1])
+		mux.HandleFunc("GET /login", sa.HandleLogin)
+		mux.HandleFunc("POST /login", sa.HandleLogin)
+		mux.HandleFunc("POST /api/logout", sa.HandleLogout)
+		handler = api.WithCORS(api.WithLogging(sa.Middleware(mux)))
+		slog.Info("auth enabled", "user", parts[0])
+	}
 
 	slog.Info("starting", "addr", *addr, "port", *port)
 	if err := http.ListenAndServe(*addr, handler); err != nil {

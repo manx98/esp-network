@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 — 控制台</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f0f2f5; color: #1a1a2e;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: #fff; border-radius: .75rem; padding: 2rem 2.5rem;
+          box-shadow: 0 4px 16px rgba(0,0,0,.1); width: 100%; max-width: 360px; }
+  h1 { font-size: 1.2rem; font-weight: 600; color: #16213e; margin-bottom: 1.5rem; text-align: center; }
+  .field { display: flex; flex-direction: column; gap: .35rem; margin-bottom: 1rem; }
+  label { font-size: .8rem; font-weight: 500; color: #6b7280; }
+  input { padding: .5rem .75rem; border: 1px solid #d1d5db; border-radius: .4rem;
+          font-size: .95rem; width: 100%; }
+  input:focus { outline: 2px solid #3b82f6; border-color: transparent; }
+  button { width: 100%; padding: .55rem; background: #3b82f6; color: #fff; border: none;
+           border-radius: .4rem; font-size: .95rem; font-weight: 500; cursor: pointer;
+           margin-top: .5rem; transition: opacity .15s; }
+  button:hover { opacity: .85; }
+  .err { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca;
+         border-radius: .4rem; padding: .5rem .75rem; font-size: .85rem; margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>控制台</h1>
+  <div id="errBox" class="err" style="display:none">用户名或密码错误</div>
+  <form method="POST" action="/login">
+    <div class="field">
+      <label>用户名</label>
+      <input type="text" name="username" autocomplete="username" autofocus required>
+    </div>
+    <div class="field">
+      <label>密码</label>
+      <input type="password" name="password" autocomplete="current-password" required>
+    </div>
+    <button type="submit">登录</button>
+  </form>
+</div>
+<script>
+  if (new URLSearchParams(location.search).get('error')) {
+    document.getElementById('errBox').style.display = '';
+  }
+</script>
+</body>
+</html>

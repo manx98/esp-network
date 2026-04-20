@@ -53,6 +53,7 @@
   <h1>ESP32 控制台</h1>
   <span id="devBadge" class="badge err">未连接</span>
   <span id="wifiBadge" class="badge err" style="margin-left:auto">WiFi: --</span>
+  <button onclick="doLogout()" style="margin-left:.75rem;padding:.3rem .8rem;font-size:.8rem;background:#6b7280;color:#fff;border:none;border-radius:.4rem;cursor:pointer">注销</button>
 </header>
 
 <main>
@@ -259,6 +260,11 @@ async function doLedSet(enabled) {
 }
 
 // ── System ───────────────────────────────────────────────────────────────────
+async function doLogout() {
+  await api('POST', '/api/logout').catch(() => {});
+  location.href = '/login';
+}
+
 async function doPing() {
   const r = await api('GET', '/api/ping');
   if (r.error) { toast(r.error, 'err'); return; }
