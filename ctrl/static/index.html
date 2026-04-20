@@ -293,7 +293,10 @@ async function doGetConfig() {
   const r = await api('GET', '/api/wifi/config');
   if (r.error) { toast(r.error, 'err'); return; }
   document.getElementById('inSSID').value = r.ssid;
-  document.getElementById('inPass').value = r.password;
+  const passEl = document.getElementById('inPass');
+  passEl.value = r.password;
+  passEl.type = 'text';
+  document.getElementById('btnPassToggle').textContent = '👁';
   setPassVisible(r.password !== '');
   toast('配置已读取');
 }

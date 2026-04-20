@@ -263,15 +263,14 @@ static void handle_wifi_get_config(const proto_frame_t *f)
         cdc_send_response(f->seq, f->cmd, PROTO_STATUS_ERROR, NULL, 0);
         return;
     }
-    /* Mask password */
     uint8_t  buf[WIFI_MGR_SSID_MAX + WIFI_MGR_PASS_MAX + 4];
     size_t   n = 0;
     uint8_t  ssid_len = (uint8_t)strlen(cfg.ssid);
     uint8_t  pass_len = (uint8_t)strlen(cfg.password);
     buf[n++] = ssid_len;
-    memcpy(&buf[n], cfg.ssid, ssid_len);   n += ssid_len;
+    memcpy(&buf[n], cfg.ssid, ssid_len);      n += ssid_len;
     buf[n++] = pass_len;
-    memset(&buf[n], '*', pass_len);        n += pass_len;
+    memcpy(&buf[n], cfg.password, pass_len);  n += pass_len;
     cdc_send_response(f->seq, f->cmd, PROTO_STATUS_OK, buf, n);
 }
 
