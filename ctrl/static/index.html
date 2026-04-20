@@ -91,7 +91,11 @@
       </div>
       <div class="field" id="passField">
         <label>密码</label>
-        <input id="inPass" type="password" placeholder="密码" maxlength="64">
+        <div style="position:relative">
+          <input id="inPass" type="password" placeholder="密码" maxlength="64" style="width:100%;padding-right:2.2rem">
+          <button type="button" id="btnPassToggle" onclick="togglePassVisible()" title="显示/隐藏密码"
+            style="position:absolute;right:.4rem;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;padding:0;font-size:1rem;line-height:1;color:#6b7280">🙈</button>
+        </div>
       </div>
       <button class="btn-primary" onclick="doSetConfig(true)">保存并连接</button>
       <button class="btn-gray"    onclick="doSetConfig(false)">仅保存</button>
@@ -371,6 +375,14 @@ function selectAP(ssid, isOpen) {
 
 function setPassVisible(visible) {
   document.getElementById('passField').style.display = visible ? '' : 'none';
+}
+
+function togglePassVisible() {
+  const input = document.getElementById('inPass');
+  const btn = document.getElementById('btnPassToggle');
+  const show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  btn.textContent = show ? '👁' : '🙈';
 }
 
 function escHtml(s) {
